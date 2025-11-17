@@ -1,0 +1,17 @@
+{
+  "name": "personal-ai-and-coding-standards",
+  "version": "1.0.0",
+  "description": "Personal AI and coding standards documentation",
+  "private": true,
+  "scripts": {
+    "format": "prettier --write \"*.md\"",
+    "format:check": "prettier --check \"*.md\"",
+    "lint:staged": "lint-staged",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^16.1.2",
+    "prettier": "^3.6.2"
+  }
+}
