@@ -1,6 +1,6 @@
 # Contributing Guidelines
 
-Thank you for your interest in contributing to this project! This document outlines our coding standards, documentation practices, and testing expectations to help maintain consistency and quality across the codebase.
+This document outlines our coding standards, documentation practices, and testing expectations to help maintain consistency and quality across the codebase.
 
 ## Planning
 
@@ -82,16 +82,19 @@ Good documentation makes the project accessible to everyone:
 
 - Keep the README accurate and reflective of the current implementation
 - Exclude future plans or historical information
-- **Introduction**: State the project's purpose, use cases, what it provides, and list key features (one sentence each)
-- **Usage**: Provide concise instructions and examples for common use cases
-- **Installation and Configuration**: List required and optional steps with their purpose and examples
-- **Technical Details**: Include architecture diagrams, process flows, and sequence diagrams using Mermaid when helpful
+- Organize the README doc in this order:
+  - **Introduction**: State the project's purpose, use cases, what it provides, and list key features (one sentence each)
+  - **Table of Contents**: A navigation aid and an overview of all the content
+  - **Usage**: Provide concise instructions and examples for common use cases
+  - **Installation and Configuration**: List required and optional steps with their purpose and examples
+  - **Technical Details**: Include architecture diagrams, process flows, and sequence diagrams using Mermaid when helpful
 
 ### Additional Documentation
 
-- If the project requires permissions, maintain a Permissions section describing each one, what access it grants, which features depend on it, and link to official documentation
-- Consider maintaining a Glossary of Terms for consistent language across code and UI
+- If the project requires permissions, maintain a Permissions section in the README describing each one, what access it grants, which features depend on it, and link to official documentation
+- Consider maintaining a Glossary of Terms in the README for consistent language across code and UI
 - Update documentation and diagrams whenever the implementation changes—they should always describe the current state
+- If the project has API endpoints available then maintain a detailed `openapi.yaml` doc in the project
 
 ## Log Levels
 
