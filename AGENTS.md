@@ -21,7 +21,7 @@ Purpose: AI-specific directives for coding agents. For general coding standards 
 ### Memory and State Management
 
 - Use git tools such as diff and reset when reverting changes; do not rely on memory.
-- Review all uncommitted changes before committing — commits should be intentional and complete.
+- Review all uncommitted changes before committing—commits should be intentional and complete.
 
 ### Documentation
 

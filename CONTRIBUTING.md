@@ -23,7 +23,7 @@ This helps ensure we're all moving in the same direction and prevents duplicate 
 ### Configuration and Environment
 
 - Avoid hard-coding URLs or other environment-specific attributes
-- Keep configuration values and constants centralized (e.g., in `config/` directories or `.env.example`)
+- Keep configuration values and constants centralized (e.g., in `config/` directories or `env.sample`)
 - Document all environment variables in a table within the README
 
 ### API Integration
@@ -94,7 +94,7 @@ Good documentation makes the project accessible to everyone:
 - If the project requires permissions, maintain a Permissions section in the README describing each one, what access it grants, which features depend on it, and link to official documentation
 - Consider maintaining a Glossary of Terms in the README for consistent language across code and UI
 - Update documentation and diagrams whenever the implementation changes—they should always describe the current state
-- If the project has API endpoints available then maintain a detailed `openapi.yaml` doc in the project
+- If the project has API endpoints available, then maintain a detailed `openapi.yaml` doc in the project
 
 ## Log Levels
 
@@ -113,10 +113,19 @@ High-level operational events describing normal behavior, such as starting or co
 Unusual or unexpected behavior that didn't stop execution. Something may require attention, but the system continued running successfully.
 
 **ERROR**  
-A failure that prevented a task or invocation from completing normally. This includes exceptions, failed API calls, or unrecoverable conditions. Errors should be bubbled up as uncaught exceptions.
+A failure that prevented a task or invocation from completing normally. This includes exceptions, failed API calls, or unrecoverable conditions.
 
 **FATAL**  
-A severe failure that stops execution and requires immediate attention. Fatal errors should be bubbled up as uncaught exceptions.
+A severe failure that stops execution and requires immediate attention.
+
+### Forge-Specific Error Handling
+
+In Forge apps, error handling follows a selective re-throw pattern to support Forge's built-in monitoring:
+
+- Non-transient errors (auth failures, configuration errors, not found) should be re-thrown after logging to trigger Forge's invocation monitoring. This ensures app owners are alerted when the success rate drops below 99%.
+- Transient errors (rate limits, timeouts, 5xx errors) should be logged but not re-thrown to avoid unnecessary alert noise. These errors are expected to resolve on retry.
+
+Use the `isTransientError()` helper function in `src/index.ts` to classify errors before deciding whether to re-throw.
 
 ---
 
