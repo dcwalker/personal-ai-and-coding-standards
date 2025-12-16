@@ -25,6 +25,7 @@ This helps ensure we're all moving in the same direction and prevents duplicate 
 - Avoid hard-coding URLs or other environment-specific attributes
 - Keep configuration values and constants centralized (e.g., in `config/` directories or `env.sample`)
 - Document all environment variables in a table within the README
+- Bypassing pre-commit hooks is strongly discouraged, they exist as a safety net
 
 ### API Integration
 
@@ -94,7 +95,7 @@ Good documentation makes the project accessible to everyone:
 - If the project requires permissions, maintain a Permissions section in the README describing each one, what access it grants, which features depend on it, and link to official documentation
 - Consider maintaining a Glossary of Terms in the README for consistent language across code and UI
 - Update documentation and diagrams whenever the implementation changes—they should always describe the current state
-- If the project has API endpoints available, then maintain a detailed `openapi.yaml` doc in the project
+- If the project has API endpoints available, then maintain a detailed `openapi.yaml` or `openapi.json` doc in the project
 
 ## Log Levels
 
