@@ -1,1 +1,23 @@
-npm run lint:staged
+#!/bin/sh
+set -e
+
+echo "Checking for eslint-disable comments..."
+DISABLED_RULES=$(find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
+  ! -path "*/node_modules/*" \
+  ! -path "*/static/dist/*" \
+  ! -path "*/reports/*" \
+  ! -path "*/.git/*" \
+  -exec grep -Hn "eslint-disable" {} + 2>/dev/null || true)
+
+if [ -n "$DISABLED_RULES" ]; then
+  echo "Error: eslint-disable comments found. Please remove them before committing:"
+  echo ""
+  echo "$DISABLED_RULES"
+  exit 1
+fi
+
+echo "Running linting on staged files..."
+yarn lint:staged
+
+echo "Running unit tests with coverage validation..."
+yarn test:cov

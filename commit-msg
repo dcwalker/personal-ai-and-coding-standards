@@ -1,0 +1,30 @@
+#!/bin/sh
+# Validate commit message format - must contain Jira ticket or NO-JIRA
+
+# Read the commit message from the file passed as argument
+commit_message=$(cat "$1")
+
+# Check for NO-JIRA bypass
+if echo "$commit_message" | grep -qE 'NO-JIRA'; then
+    echo "⚠️  JIRA validation bypassed via NO-JIRA"
+    exit 0
+fi
+
+# Check if message contains a Jira ticket anywhere in the message
+# Pattern: PROJECT-123 where PROJECT is uppercase letters/numbers
+if echo "$commit_message" | grep -qE '[A-Z][A-Z0-9]+-[0-9]+'; then
+    # Valid - contains Jira ticket
+    exit 0
+fi
+
+# No Jira ticket found and no bypass
+echo ""
+echo "❌ Commit message must contain a Jira ticket or \`NO-JIRA\` somewhere in the commit message"
+echo ""
+echo "Examples:"
+echo "[W00T-1163] Adding feature X"
+echo "Update documentation (relates to ABC-123)"
+echo "NO-JIRA: Fix typo in README"
+echo "Update build config (NO-JIRA)"
+echo ""
+exit 1

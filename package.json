@@ -7,9 +7,17 @@
     "format": "prettier --write \"*.md\"",
     "format:check": "prettier --check \"*.md\"",
     "lint:staged": "lint-staged",
-    "prepare": "husky"
+    "prepare": "husky",
+    "test:cov": "echo 'No tests configured' && exit 0"
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.1.0",
+    "@eslint/js": "^9.15.0",
+    "@typescript-eslint/eslint-plugin": "^8.15.0",
+    "@typescript-eslint/parser": "^8.15.0",
+    "eslint": "^9.15.0",
+    "eslint-plugin-jsdoc": "^48.10.2",
+    "globals": "^15.11.0",
     "husky": "^9.1.7",
     "lint-staged": "^16.1.2",
     "prettier": "^3.6.2"
