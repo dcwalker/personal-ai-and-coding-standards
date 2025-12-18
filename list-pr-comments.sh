@@ -395,7 +395,7 @@ else
       
       # Display comment details
       echo "$COMMENT" | jq -r '
-        "Type:              \(.type // "N/A" | ascii_upcase)
+        "Type:              \((.type // "N/A") | ascii_upcase)
 Author:            \(.user.login // "N/A")
 Author Type:       \(.user.type // "N/A")
 Created:           \(.created_at // "N/A")

@@ -5,6 +5,7 @@
 # Run with -h or --help for full usage information
 
 SONAR_HOST="${SONAR_HOST_URL}"
+SONAR_HOST="${SONAR_HOST%/}/"  # Ensure trailing slash
 SONAR_TOKEN="${SONAR_TOKEN}"
 
 # Try to get project key from environment variable, or read from sonar-project.properties
@@ -281,7 +282,7 @@ if command -v jq &> /dev/null; then
       # Display all available fields
       echo "$ISSUE" | jq -r '
         "Key:              \(.key // "N/A")
-Severity:          \(.severity // "N/A" | ascii_upcase)
+Severity:          \((.severity // "N/A") | ascii_upcase)
 Type:              \(.type // "N/A")
 Status:            \(.status // "N/A")
 Rule:              \(.rule // "N/A")
