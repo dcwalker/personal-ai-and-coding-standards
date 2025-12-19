@@ -17,8 +17,10 @@ fi
 
 PULL_REQUEST=""
 COMMENT_URL=""
-BOT_FILTER="bots"
+USER_FILTER="all"
 COMMENT_TYPE="all"
+PATH_FILTER=""
+SHOW_RESOLVED=""
 JSON_OUTPUT=""
 COUNT_ONLY=""
 
@@ -34,15 +36,11 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --bots)
-      BOT_FILTER="bots"
+      USER_FILTER="bots"
       shift
       ;;
     --humans)
-      BOT_FILTER="humans"
-      shift
-      ;;
-    --all-users)
-      BOT_FILTER="all"
+      USER_FILTER="humans"
       shift
       ;;
     -t|--type)
@@ -57,27 +55,40 @@ while [[ $# -gt 0 ]]; do
       COUNT_ONLY="1"
       shift
       ;;
+    -p|--path)
+      PATH_FILTER="$2"
+      shift 2
+      ;;
+    --show-resolved)
+      SHOW_RESOLVED="1"
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
       echo "  -pr, --pull-request <number>  Filter comments for a specific pull request"
       echo "  -u, --url <url>               Get a specific comment by URL"
-      echo "  --bots                        Show only bot comments (default)"
+      echo "  --bots                        Show only bot comments"
       echo "  --humans                      Show only human comments"
-      echo "  --all-users                   Show comments from both bots and humans"
       echo "  -t, --type <type>            Filter by comment type: all, review, issue (default: all)"
       echo "                               - all: both review comments and issue comments"
       echo "                               - review: inline code review comments"
       echo "                               - issue: PR conversation comments"
+      echo "  -p, --path <path>             Filter review comments by file path (exact match)"
+      echo "                               Note: Only applies to review comments, not issue comments"
+      echo "  --show-resolved               Show resolved comments (default: only unresolved)"
       echo "  --json                        Output only JSON (no formatted text)"
       echo "  --count                       Output only the count of items"
       echo "  -h, --help                    Show this help message"
       echo ""
       echo "Examples:"
-      echo "  $0 -pr 19                     List all bot comments for PR #19"
-      echo "  $0 -pr 19 --humans            List all human comments for PR #19"
-      echo "  $0 -pr 19 -t review           List only inline review comments from bots"
+      echo "  $0 -pr 19                     List all comments for PR #19 (default: all users)"
+      echo "  $0 -pr 19 --bots              List only bot comments for PR #19"
+      echo "  $0 -pr 19 --humans            List only human comments for PR #19"
+      echo "  $0 -pr 19 -t review           List only inline review comments"
+      echo "  $0 -pr 19 -p src/utils.ts     List comments for a specific file path"
+      echo "  $0 -pr 19 --show-resolved     List all comments including resolved ones"
       echo "  $0 -u <comment-url>           Get details for a specific comment by URL"
       echo "  $0 --json                     Output only JSON format"
       echo "  $0 -pr 19 --json              Output JSON for PR #19 comments"
@@ -105,12 +116,12 @@ case "$COMMENT_TYPE" in
     ;;
 esac
 
-# Validate bot filter
-case "$BOT_FILTER" in
+# Validate user filter
+case "$USER_FILTER" in
   bots|humans|all)
     ;;
   *)
-    echo "Error: Invalid bot filter '${BOT_FILTER}'. Must be one of: bots, humans, all"
+    echo "Error: Invalid user filter '${USER_FILTER}'. Must be one of: bots, humans, all"
     exit 1
     ;;
 esac
@@ -241,57 +252,132 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
     echo "Fetching comments for PR #${PULL_REQUEST} in ${REPO}"
   fi
   
-  # Fetch comments based on type
-  REVIEW_COMMENTS=""
-  ISSUE_COMMENTS=""
+  # Extract owner and repo from REPO variable for GraphQL queries
+  OWNER=$(echo "$REPO" | cut -d'/' -f1)
+  REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
   
-  if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "review" ]; then
-    if [ -z "$JSON_OUTPUT" ]; then
-      echo "Fetching review comments..."
-    fi
-    REVIEW_COMMENTS=$(gh api "repos/${REPO}/pulls/${PULL_REQUEST}/comments" 2>&1)
+  # Fetch comments using GraphQL for consistency
+  REVIEW_COMMENTS="[]"
+  ISSUE_COMMENTS="[]"
+  
+  # Build GraphQL query to fetch both review comments and issue comments
+  if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "review" ] || [ "$COMMENT_TYPE" = "issue" ]; then
+    # GraphQL query to get review threads (with resolved status) and issue comments
+    GRAPHQL_QUERY="{
+      repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+        pullRequest(number: $PULL_REQUEST) {
+          reviewThreads(first: 100) {
+            nodes {
+              isResolved
+              comments(first: 100) {
+                nodes {
+                  id
+                  databaseId
+                  bodyText
+                  path
+                  line
+                  diffHunk
+                  createdAt
+                  updatedAt
+                  author {
+                    login
+                    ... on Bot {
+                      id
+                    }
+                  }
+                  url
+                }
+              }
+            }
+          }
+          comments(first: 100) {
+            nodes {
+              id
+              databaseId
+              bodyText
+              createdAt
+              updatedAt
+              author {
+                login
+                ... on Bot {
+                  id
+                }
+              }
+              url
+            }
+          }
+        }
+      }
+    }"
+    
+    GRAPHQL_RESPONSE=$(gh api graphql -f query="$GRAPHQL_QUERY" 2>&1)
     API_EXIT_CODE=$?
-    if [ $API_EXIT_CODE -ne 0 ] || [ -z "$REVIEW_COMMENTS" ]; then
-      echo "Warning: Failed to fetch review comments (exit code: $API_EXIT_CODE)"
-      if [ -n "$REVIEW_COMMENTS" ]; then
-        echo "Error details: $REVIEW_COMMENTS" | head -3
+    
+    if [ $API_EXIT_CODE -ne 0 ] || [ -z "$GRAPHQL_RESPONSE" ]; then
+      echo "Warning: Failed to fetch comments via GraphQL (exit code: $API_EXIT_CODE)"
+      if [ -n "$GRAPHQL_RESPONSE" ]; then
+        echo "Error details: $GRAPHQL_RESPONSE" | head -3
       fi
-      REVIEW_COMMENTS="[]"
     else
       # Validate it's valid JSON
-      if ! echo "$REVIEW_COMMENTS" | jq empty 2>/dev/null; then
-        echo "Warning: Invalid JSON received for review comments"
-        REVIEW_COMMENTS="[]"
+      if ! echo "$GRAPHQL_RESPONSE" | jq empty 2>/dev/null; then
+        echo "Warning: Invalid JSON received from GraphQL"
       else
-        REVIEW_COUNT=$(echo "$REVIEW_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
-        if [ -z "$JSON_OUTPUT" ]; then
-          echo "Found $REVIEW_COUNT review comment(s)"
+        # Extract review comments from review threads and flatten into array
+        # Also add resolved status and transform to match REST API format
+        if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "review" ]; then
+          REVIEW_COMMENTS=$(echo "$GRAPHQL_RESPONSE" | jq --arg pr "$PULL_REQUEST" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+            .data.repository.pullRequest.reviewThreads.nodes[] |
+            .isResolved as $resolved |
+            .comments.nodes[] |
+            {
+              id: .databaseId,
+              node_id: .id,
+              body: .bodyText,
+              path: .path,
+              line: .line,
+              diff_hunk: .diffHunk,
+              created_at: .createdAt,
+              updated_at: .updatedAt,
+              user: {
+                login: .author.login,
+                type: (if (.author | has("id")) then "Bot" else "User" end)
+              },
+              html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#discussion_r\(.databaseId)"),
+              url: .url,
+              isResolved: $resolved
+            }
+          ' 2>/dev/null | jq -s '.' 2>/dev/null || echo "[]")
+          
+          REVIEW_COUNT_TOTAL=$(echo "$REVIEW_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
+          if [ -z "$JSON_OUTPUT" ]; then
+            echo "Found $REVIEW_COUNT_TOTAL review comment(s)"
+          fi
         fi
-      fi
-    fi
-  fi
-  
-  if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "issue" ]; then
-    if [ -z "$JSON_OUTPUT" ]; then
-      echo "Fetching issue comments..."
-    fi
-    ISSUE_COMMENTS=$(gh api "repos/${REPO}/issues/${PULL_REQUEST}/comments" 2>&1)
-    API_EXIT_CODE=$?
-    if [ $API_EXIT_CODE -ne 0 ] || [ -z "$ISSUE_COMMENTS" ]; then
-      echo "Warning: Failed to fetch issue comments (exit code: $API_EXIT_CODE)"
-      if [ -n "$ISSUE_COMMENTS" ]; then
-        echo "Error details: $ISSUE_COMMENTS" | head -3
-      fi
-      ISSUE_COMMENTS="[]"
-    else
-      # Validate it's valid JSON
-      if ! echo "$ISSUE_COMMENTS" | jq empty 2>/dev/null; then
-        echo "Warning: Invalid JSON received for issue comments"
-        ISSUE_COMMENTS="[]"
-      else
-        ISSUE_COUNT=$(echo "$ISSUE_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
-        if [ -z "$JSON_OUTPUT" ]; then
-          echo "Found $ISSUE_COUNT issue comment(s)"
+        
+        # Extract issue comments
+        if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "issue" ]; then
+          ISSUE_COMMENTS=$(echo "$GRAPHQL_RESPONSE" | jq --arg pr "$PULL_REQUEST" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+            .data.repository.pullRequest.comments.nodes[] |
+            {
+              id: .databaseId,
+              node_id: .id,
+              body: .bodyText,
+              created_at: .createdAt,
+              updated_at: .updatedAt,
+              user: {
+                login: .author.login,
+                type: (if (.author | has("id")) then "Bot" else "User" end)
+              },
+              html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#issuecomment-\(.databaseId)"),
+              url: .url
+            }
+          ' 2>/dev/null | jq -s '.' 2>/dev/null || echo "[]")
+          
+          ISSUE_COUNT_TOTAL=$(echo "$ISSUE_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
+          if [ -z "$JSON_OUTPUT" ]; then
+            echo "Found $ISSUE_COUNT_TOTAL issue comment(s)"
+          fi
         fi
       fi
     fi
@@ -300,16 +386,59 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
   # Filter and combine comments
   ALL_COMMENTS="[]"
   
+  # Track totals before filtering for summary display
+  REVIEW_TOTAL_BEFORE_FILTER=0
+  ISSUE_TOTAL_BEFORE_FILTER=0
+  if [ -n "$REVIEW_COMMENTS" ] && [ "$REVIEW_COMMENTS" != "[]" ]; then
+    REVIEW_TOTAL_BEFORE_FILTER=$(echo "$REVIEW_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
+  fi
+  if [ -n "$ISSUE_COMMENTS" ] && [ "$ISSUE_COMMENTS" != "[]" ]; then
+    ISSUE_TOTAL_BEFORE_FILTER=$(echo "$ISSUE_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
+  fi
+  
   if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "review" ]; then
     if [ -n "$REVIEW_COMMENTS" ] && [ "$REVIEW_COMMENTS" != "[]" ]; then
-      REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$BOT_FILTER" '
-        [.[] | 
-          if $filter == "bots" then select(.user.type == "Bot")
-          elif $filter == "humans" then select(.user.type != "Bot")
-          else .
-          end | 
-          . + {type: "review"}]
-      ' 2>/dev/null)
+      if [ -n "$PATH_FILTER" ] && [ -n "$SHOW_RESOLVED" ]; then
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg path "$PATH_FILTER" '
+          [.[] | 
+            if $filter == "bots" then select(.user.type == "Bot")
+            elif $filter == "humans" then select(.user.type != "Bot")
+            else .
+            end |
+            select(.path == $path) |
+            . + {type: "review"}]
+        ' 2>/dev/null)
+      elif [ -n "$PATH_FILTER" ] && [ -z "$SHOW_RESOLVED" ]; then
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg path "$PATH_FILTER" '
+          [.[] | 
+            if $filter == "bots" then select(.user.type == "Bot")
+            elif $filter == "humans" then select(.user.type != "Bot")
+            else .
+            end |
+            select(.path == $path) |
+            select(.isResolved != true) |
+            . + {type: "review"}]
+        ' 2>/dev/null)
+      elif [ -n "$SHOW_RESOLVED" ]; then
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" '
+          [.[] | 
+            if $filter == "bots" then select(.user.type == "Bot")
+            elif $filter == "humans" then select(.user.type != "Bot")
+            else .
+            end | 
+            . + {type: "review"}]
+        ' 2>/dev/null)
+      else
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" '
+          [.[] | 
+            if $filter == "bots" then select(.user.type == "Bot")
+            elif $filter == "humans" then select(.user.type != "Bot")
+            else .
+            end |
+            select(.isResolved != true) |
+            . + {type: "review"}]
+        ' 2>/dev/null)
+      fi
       if [ $? -eq 0 ] && [ -n "$REVIEW_FILTERED" ]; then
         FILTERED_COUNT=$(echo "$REVIEW_FILTERED" | jq 'length' 2>/dev/null || echo "0")
         if [ "$FILTERED_COUNT" -gt 0 ]; then
@@ -327,7 +456,7 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
   
   if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "issue" ]; then
     if [ -n "$ISSUE_COMMENTS" ] && [ "$ISSUE_COMMENTS" != "[]" ]; then
-      ISSUE_FILTERED=$(echo "$ISSUE_COMMENTS" | jq --arg filter "$BOT_FILTER" '
+      ISSUE_FILTERED=$(echo "$ISSUE_COMMENTS" | jq --arg filter "$USER_FILTER" '
         [.[] | 
           if $filter == "bots" then select(.user.type == "Bot")
           elif $filter == "humans" then select(.user.type != "Bot")
@@ -372,25 +501,43 @@ elif [ -n "$JSON_OUTPUT" ]; then
 else
   echo ""
   echo "=== Comments Summary ==="
-  case "$BOT_FILTER" in
+  case "$USER_FILTER" in
     bots)
-      echo "Total bot comments: $TOTAL"
+      echo "Total bot comments: $TOTAL (from $REVIEW_TOTAL_BEFORE_FILTER review, $ISSUE_TOTAL_BEFORE_FILTER issue)"
       ;;
     humans)
-      echo "Total human comments: $TOTAL"
+      echo "Total human comments: $TOTAL (from $REVIEW_TOTAL_BEFORE_FILTER review, $ISSUE_TOTAL_BEFORE_FILTER issue)"
       ;;
     all)
-      echo "Total comments: $TOTAL"
+      echo "Total comments: $TOTAL (from $REVIEW_TOTAL_BEFORE_FILTER review, $ISSUE_TOTAL_BEFORE_FILTER issue)"
       ;;
   esac
+  TOTAL_BEFORE_FILTER=$((REVIEW_TOTAL_BEFORE_FILTER + ISSUE_TOTAL_BEFORE_FILTER))
+  if [ "$TOTAL" -ne "$TOTAL_BEFORE_FILTER" ]; then
+    FILTER_NOTES=""
+    if [ -z "$SHOW_RESOLVED" ]; then
+      FILTER_NOTES="unresolved status"
+    fi
+    if [ -n "$PATH_FILTER" ]; then
+      if [ -n "$FILTER_NOTES" ]; then
+        FILTER_NOTES="${FILTER_NOTES}, path filter"
+      else
+        FILTER_NOTES="path filter"
+      fi
+    fi
+    if [ -n "$FILTER_NOTES" ]; then
+      echo "Note: Filtered by $FILTER_NOTES"
+    fi
+  fi
   echo ""
 
   if [ "$TOTAL" -gt 0 ]; then
     for i in $(seq 0 $((TOTAL - 1))); do
       COMMENT=$(echo "$ALL_COMMENTS" | jq ".[$i]")
+      COMMENT_ID=$(echo "$COMMENT" | jq -r '.id // "N/A"')
       
       echo ""
-      echo "Comment #$((i + 1))"
+      echo "Comment ID: $COMMENT_ID"
       echo "---"
       
       # Display comment details

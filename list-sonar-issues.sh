@@ -28,6 +28,7 @@ TYPE=""
 STATUS=""
 RULE=""
 ISSUE_KEY=""
+COMPONENT=""
 JSON_OUTPUT=""
 COUNT_ONLY=""
 
@@ -58,6 +59,10 @@ while [[ $# -gt 0 ]]; do
       ISSUE_KEY="$2"
       shift 2
       ;;
+    -c|--component)
+      COMPONENT="$2"
+      shift 2
+      ;;
     --json)
       JSON_OUTPUT="1"
       shift
@@ -76,6 +81,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --status <status>             Filter by status: OPEN, CONFIRMED, REOPENED, RESOLVED, CLOSED"
       echo "  -r, --rule <ruleKey>          Filter by rule key (e.g., typescript:S6606)"
       echo "  -k, --key <issueKey>          Filter by specific issue key (e.g., AZsvly6yO42lZpvH9OC5)"
+      echo "  -c, --component <path>        Filter by component (file path, exact match)"
       echo "  --json                        Output only JSON (no formatted text)"
       echo "  --count                       Output only the count of items"
       echo "  -h, --help                    Show this help message"
@@ -91,6 +97,7 @@ while [[ $# -gt 0 ]]; do
       echo "                                       Note: Issue key search may not find issues"
       echo "                                       that only exist in PR context. Use -pr with"
       echo "                                       the key for better results."
+      echo "  $0 -c src/utils/logger.ts             List issues for a specific component"
       echo "  $0 -pr 19 -s MAJOR -t CODE_SMELL      Combine multiple filters"
       echo "  $0 --json                              Output only JSON format"
       echo "  $0 -pr 19 --json                      Output JSON for PR #19 issues"
@@ -198,6 +205,11 @@ if [ -n "$RULE" ]; then
   FILTER_MSG="${FILTER_MSG}, Rule: ${RULE}"
 fi
 
+# Add component filter if provided (note: this will be applied client-side in jq)
+if [ -n "$COMPONENT" ]; then
+  FILTER_MSG="${FILTER_MSG}, Component: ${COMPONENT}"
+fi
+
 # Issue key filter is already handled above in the initial PARAMS setup
 
 if [ -z "$JSON_OUTPUT" ]; then
@@ -213,20 +225,17 @@ if command -v jq &> /dev/null; then
   # When searching by key, we search broadly, so we only filter by key (not project)
   # Otherwise, filter issues to only include our project (API sometimes returns issues from other projects)
   if [ -n "$ISSUE_KEY" ]; then
-    FILTERED_RESPONSE=$(echo "$RESPONSE" | jq --arg key "$ISSUE_KEY" '{
-      total: ([.issues[] | select(.key == $key)] | length),
-      paging: .paging,
-      issues: [.issues[] | select(.key == $key)],
-      components: .components,
-      rules: .rules,
-      users: .users
-    }')
-    # If not found with resolved=false, try without the filter (might be a resolved issue)
-    if [ "$(echo "$FILTERED_RESPONSE" | jq -r '.total')" = "0" ] && [ -z "$STATUS" ]; then
-      # Retry without resolved filter
-      RETRY_PARAMS="${PARAMS//&resolved=false/}"
-      RETRY_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${API_URL}?${RETRY_PARAMS}")
-      FILTERED_RESPONSE=$(echo "$RETRY_RESPONSE" | jq --arg key "$ISSUE_KEY" '{
+    if [ -n "$COMPONENT" ]; then
+      FILTERED_RESPONSE=$(echo "$RESPONSE" | jq --arg key "$ISSUE_KEY" --arg component "$COMPONENT" '{
+        total: ([.issues[] | select(.key == $key and .component == $component)] | length),
+        paging: .paging,
+        issues: [.issues[] | select(.key == $key and .component == $component)],
+        components: .components,
+        rules: .rules,
+        users: .users
+      }')
+    else
+      FILTERED_RESPONSE=$(echo "$RESPONSE" | jq --arg key "$ISSUE_KEY" '{
         total: ([.issues[] | select(.key == $key)] | length),
         paging: .paging,
         issues: [.issues[] | select(.key == $key)],
@@ -235,15 +244,51 @@ if command -v jq &> /dev/null; then
         users: .users
       }')
     fi
+    # If not found with resolved=false, try without the filter (might be a resolved issue)
+    if [ "$(echo "$FILTERED_RESPONSE" | jq -r '.total')" = "0" ] && [ -z "$STATUS" ]; then
+      # Retry without resolved filter
+      RETRY_PARAMS="${PARAMS//&resolved=false/}"
+      RETRY_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${API_URL}?${RETRY_PARAMS}")
+      if [ -n "$COMPONENT" ]; then
+        FILTERED_RESPONSE=$(echo "$RETRY_RESPONSE" | jq --arg key "$ISSUE_KEY" --arg component "$COMPONENT" '{
+          total: ([.issues[] | select(.key == $key and .component == $component)] | length),
+          paging: .paging,
+          issues: [.issues[] | select(.key == $key and .component == $component)],
+          components: .components,
+          rules: .rules,
+          users: .users
+        }')
+      else
+        FILTERED_RESPONSE=$(echo "$RETRY_RESPONSE" | jq --arg key "$ISSUE_KEY" '{
+          total: ([.issues[] | select(.key == $key)] | length),
+          paging: .paging,
+          issues: [.issues[] | select(.key == $key)],
+          components: .components,
+          rules: .rules,
+          users: .users
+        }')
+      fi
+    fi
   else
-    FILTERED_RESPONSE=$(echo "$RESPONSE" | jq --arg project "$PROJECT_KEY" '{
-      total: ([.issues[] | select(.project == $project)] | length),
-      paging: .paging,
-      issues: [.issues[] | select(.project == $project)],
-      components: .components,
-      rules: .rules,
-      users: .users
-    }')
+    if [ -n "$COMPONENT" ]; then
+      FILTERED_RESPONSE=$(echo "$RESPONSE" | jq --arg project "$PROJECT_KEY" --arg component "$COMPONENT" '{
+        total: ([.issues[] | select(.project == $project and .component == $component)] | length),
+        paging: .paging,
+        issues: [.issues[] | select(.project == $project and .component == $component)],
+        components: .components,
+        rules: .rules,
+        users: .users
+      }')
+    else
+      FILTERED_RESPONSE=$(echo "$RESPONSE" | jq --arg project "$PROJECT_KEY" '{
+        total: ([.issues[] | select(.project == $project)] | length),
+        paging: .paging,
+        issues: [.issues[] | select(.project == $project)],
+        components: .components,
+        rules: .rules,
+        users: .users
+      }')
+    fi
   fi
   
   TOTAL=$(echo "$FILTERED_RESPONSE" | jq -r '.total // 0')
@@ -274,9 +319,10 @@ if command -v jq &> /dev/null; then
     if [ "$ISSUE_COUNT" -gt 0 ]; then
       for i in $(seq 0 $((ISSUE_COUNT - 1))); do
       ISSUE=$(echo "$FILTERED_RESPONSE" | jq ".issues[$i]")
+      ISSUE_KEY_VALUE=$(echo "$ISSUE" | jq -r '.key // "N/A"')
       
       echo ""
-      echo "Issue #$((i + 1))"
+      echo "Issue Key: $ISSUE_KEY_VALUE"
       echo "---"
       
       # Display all available fields
