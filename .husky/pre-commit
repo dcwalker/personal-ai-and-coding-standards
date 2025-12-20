@@ -1,6 +1,7 @@
 #!/bin/sh
 set -e
 
+# Check for eslint-disable comments
 echo "Checking for eslint-disable comments..."
 DISABLED_RULES=$(find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
   ! -path "*/node_modules/*" \
@@ -16,8 +17,14 @@ if [ -n "$DISABLED_RULES" ]; then
   exit 1
 fi
 
-echo "Running linting on staged files..."
+# Run linting on staged files
 yarn lint:staged
 
-echo "Running unit tests with coverage validation..."
+# Run unit tests with coverage validation
+echo "Running backend unit tests with coverage validation..."
 yarn test:cov
+
+# Run frontend unit tests with coverage validation
+echo "Running frontend unit tests with coverage validation..."
+yarn test:cov:frontend
+

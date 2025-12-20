@@ -3,12 +3,14 @@
   "version": "1.0.0",
   "description": "Personal AI and coding standards documentation",
   "private": true,
+  "type": "module",
   "scripts": {
     "format": "prettier --write \"*.md\"",
     "format:check": "prettier --check \"*.md\"",
     "lint:staged": "lint-staged",
     "prepare": "husky",
-    "test:cov": "echo 'No tests configured' && exit 0"
+    "test:cov": "echo 'No tests configured' && exit 0",
+    "test:cov:frontend": "echo 'No tests configured' && exit 0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.1.0",

@@ -9,7 +9,7 @@ FILES_TO_COPY = [
     'AGENTS.md',
     'CONTRIBUTING.md',
     'eslint.config.js',
-    '.prettierrc.js',
+    '.prettierrc.cjs',
     'eslint-local-rules/index.js',
     'eslint-local-rules/no-consecutive-logging.js',
     'list-sonar-issues.sh',

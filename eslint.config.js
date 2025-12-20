@@ -27,7 +27,7 @@ export default [
       'test/helpers/**/*.js',
       'test/jest_setup.ts',
       '*.config.{js,cjs}',
-      '.prettierrc.js',
+      '.prettierrc.cjs',
       'eslint-local-rules/**/*',
     ],
   },
