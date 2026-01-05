@@ -12,8 +12,8 @@ FILES_TO_COPY = [
     '.prettierrc.cjs',
     'eslint-local-rules/index.js',
     'eslint-local-rules/no-consecutive-logging.js',
-    'list-sonar-issues.sh',
-    'list-pr-comments.sh',
+    'scripts/list-sonar-issues.sh',
+    'scripts/list-pr-comments.sh',
 ]
 
 
