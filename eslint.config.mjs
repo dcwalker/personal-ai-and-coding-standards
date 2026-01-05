@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { FlatCompat } from '@eslint/eslintrc';
 import prettierConfig from 'eslint-config-prettier';
 import jsdoc from 'eslint-plugin-jsdoc';
-import localRules from './eslint-local-rules/index.js';
+import localRules from './eslint-local-rules/index.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -105,3 +105,4 @@ export default [
   },
   prettierConfig,
 ];
+

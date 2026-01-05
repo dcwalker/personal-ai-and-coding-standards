@@ -8,10 +8,10 @@ from pathlib import Path
 FILES_TO_COPY = [
     'AGENTS.md',
     'CONTRIBUTING.md',
-    'eslint.config.js',
+    'eslint.config.mjs',
     '.prettierrc.cjs',
-    'eslint-local-rules/index.js',
-    'eslint-local-rules/no-consecutive-logging.js',
+    'eslint-local-rules/index.mjs',
+    'eslint-local-rules/no-consecutive-logging.mjs',
     'scripts/list-sonar-issues.sh',
     'scripts/list-pr-comments.sh',
 ]
