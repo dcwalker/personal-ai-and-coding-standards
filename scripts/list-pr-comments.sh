@@ -2038,6 +2038,9 @@ if { [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]
   fi
 fi
 
+# Sort comments by created date (oldest first) before displaying
+ALL_COMMENTS=$(echo "$ALL_COMMENTS" | jq 'sort_by(.created_at // .createdAt // "")' 2>/dev/null || echo "$ALL_COMMENTS")
+
 # Calculate total, defaulting to 0 if jq fails or returns empty
 TOTAL=$(echo "$ALL_COMMENTS" | jq -r 'length // 0' 2>/dev/null)
 if [ -z "$TOTAL" ] || [ "$TOTAL" = "null" ]; then
