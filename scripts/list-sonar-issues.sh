@@ -49,6 +49,7 @@ ISSUE_KEY=""
 COMPONENT=""
 JSON_OUTPUT=""
 COUNT_ONLY=""
+DETAILS=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -89,6 +90,10 @@ while [[ $# -gt 0 ]]; do
       COUNT_ONLY="1"
       shift
       ;;
+    --details)
+      DETAILS="1"
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
@@ -102,6 +107,8 @@ while [[ $# -gt 0 ]]; do
       echo "  -c, --component <path>        Filter by component (file path, exact match)"
       echo "  --json                        Output only JSON (no formatted text)"
       echo "  --count                       Output only the count of items"
+      echo "  --details                      Include detailed information (risk, fix guidance, etc.)"
+      echo "                                Note: Details are always included when searching by key (-k)"
       echo "  -h, --help                    Show this help message"
       echo ""
       echo "Examples:"
@@ -122,6 +129,8 @@ while [[ $# -gt 0 ]]; do
       echo "  $0 -pr 19 --json                      Output JSON for PR #19 issues"
       echo "  $0 --count                            Output only the count"
       echo "  $0 -pr 19 -s MAJOR --count            Output count of MAJOR issues for PR #19"
+      echo "  $0 --details                          List all issues with detailed information"
+      echo "  $0 -k AZsvly6yO42lZpvH9OC5            Show details for a specific issue (details auto-included)"
       exit 0
       ;;
     *)
@@ -145,6 +154,8 @@ fi
 # Build API URLs
 ISSUES_API_URL="${SONAR_HOST}api/issues/search"
 HOTSPOTS_API_URL="${SONAR_HOST}api/hotspots/search"
+ISSUE_DETAIL_API_URL="${SONAR_HOST}api/issues/show"
+HOTSPOT_DETAIL_API_URL="${SONAR_HOST}api/hotspots/show"
 
 # When searching by issue key, search within project and filter client-side
 # The 'issues' API parameter doesn't work reliably, so we filter client-side instead
@@ -237,13 +248,14 @@ fi
 # Issue key filter is already handled above in the initial PARAMS setup
 
 # Determine which endpoints to query based on type filter
-# Note: When searching by issue key, only search issues (not hotspots)
+# Note: When searching by issue key, search both issues and hotspots (key could be either)
 FETCH_ISSUES="false"
 FETCH_HOTSPOTS="false"
 
 if [ -n "$ISSUE_KEY" ]; then
-  # Issue key search only applies to issues, not hotspots
+  # Issue key search applies to both issues and hotspots (key could be either)
   FETCH_ISSUES="true"
+  FETCH_HOTSPOTS="true"
 elif [ -z "$TYPE" ]; then
   # No type filter: fetch both issues and hotspots
   FETCH_ISSUES="true"
@@ -425,8 +437,22 @@ if command -v jq &> /dev/null; then
       # Invalid JSON response
       FILTERED_HOTSPOTS_RESPONSE='{"total": 0, "hotspots": []}'
     else
-      # Filter by component if provided, and filter by status if needed
-      if [ -n "$COMPONENT" ]; then
+      # When searching by issue key, filter by key client-side (API doesn't support key parameter)
+      if [ -n "$ISSUE_KEY" ]; then
+        if [ -n "$COMPONENT" ]; then
+          FILTERED_HOTSPOTS_RESPONSE=$(echo "$HOTSPOTS_RESPONSE" | jq --arg key "$ISSUE_KEY" --arg component "$COMPONENT" '{
+            total: ([.hotspots[]? | select(.key == $key and .component == $component)] | length),
+            paging: .paging,
+            hotspots: [.hotspots[]? | select(.key == $key and .component == $component)]
+          }' 2>/dev/null)
+        else
+          FILTERED_HOTSPOTS_RESPONSE=$(echo "$HOTSPOTS_RESPONSE" | jq --arg key "$ISSUE_KEY" '{
+            total: ([.hotspots[]? | select(.key == $key)] | length),
+            paging: .paging,
+            hotspots: [.hotspots[]? | select(.key == $key)]
+          }' 2>/dev/null)
+        fi
+      elif [ -n "$COMPONENT" ]; then
         FILTERED_HOTSPOTS_RESPONSE=$(echo "$HOTSPOTS_RESPONSE" | jq --arg project "$PROJECT_KEY" --arg component "$COMPONENT" '{
           total: ([.hotspots[]? | select(.project == $project and .component == $component)] | length),
           paging: .paging,
@@ -546,26 +572,60 @@ if command -v jq &> /dev/null; then
   elif [ -n "$JSON_OUTPUT" ]; then
     echo "$FILTERED_RESPONSE" | jq '.'
   else
-    echo ""
-    echo "=== Summary ==="
-    if [ -n "$ISSUE_KEY" ]; then
-      if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total items found: $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
-      elif [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total security hotspots found: $HOTSPOTS_TOTAL"
-      else
-        echo "Total issues found: $ISSUES_TOTAL"
-      fi
-    else
-      if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total items for project '${PROJECT_KEY}': $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
-      elif [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total security hotspots for project '${PROJECT_KEY}': $HOTSPOTS_TOTAL"
-      else
-        echo "Total issues for project '${PROJECT_KEY}': $ISSUES_TOTAL"
-      fi
+    # Fetch detailed information if requested (--details flag or when searching by key)
+    FETCH_DETAILS="false"
+    if [ -n "$DETAILS" ] || [ -n "$ISSUE_KEY" ]; then
+      FETCH_DETAILS="true"
     fi
-    echo ""
+    
+    # If fetching details, enrich each item with detailed information
+    if [ "$FETCH_DETAILS" = "true" ]; then
+      ISSUE_COUNT=$(echo "$FILTERED_RESPONSE" | jq -r '.issues | length // 0')
+      ENRICHED_ITEMS="[]"
+      
+      for i in $(seq 0 $((ISSUE_COUNT - 1))); do
+        ITEM=$(echo "$FILTERED_RESPONSE" | jq ".issues[$i]")
+        ITEM_KEY=$(echo "$ITEM" | jq -r '.key // ""')
+        IS_HOTSPOT=$(echo "$ITEM" | jq -r '.isHotspot // false')
+        
+        if [ -n "$ITEM_KEY" ] && [ "$ITEM_KEY" != "N/A" ]; then
+          DETAIL_RESPONSE=""
+          if [ "$IS_HOTSPOT" = "true" ]; then
+            # Fetch hotspot details
+            DETAIL_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${HOTSPOT_DETAIL_API_URL}?hotspot=${ITEM_KEY}")
+          else
+            # Fetch issue details
+            DETAIL_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${ISSUE_DETAIL_API_URL}?issue=${ITEM_KEY}")
+          fi
+          
+          # Merge detail response with item if valid
+          if [ -n "$DETAIL_RESPONSE" ] && echo "$DETAIL_RESPONSE" | jq empty 2>/dev/null; then
+            ERROR_MSG=$(echo "$DETAIL_RESPONSE" | jq -r '.errors[]?.msg // empty' 2>/dev/null)
+            if [ -z "$ERROR_MSG" ]; then
+              # Extract the actual detail data (API may return nested structure)
+              if [ "$IS_HOTSPOT" = "true" ]; then
+                # Hotspot detail API returns {hotspot: {...}}
+                DETAIL_DATA=$(echo "$DETAIL_RESPONSE" | jq '.hotspot // . // {}')
+              else
+                # Issue detail API returns {issue: {...}}
+                DETAIL_DATA=$(echo "$DETAIL_RESPONSE" | jq '.issue // . // {}')
+              fi
+              
+              # Merge the detail data into the item
+              if [ -n "$DETAIL_DATA" ] && [ "$DETAIL_DATA" != "null" ] && [ "$DETAIL_DATA" != "{}" ]; then
+                ITEM=$(echo "$ITEM" | jq --argjson details "$DETAIL_DATA" '. + $details')
+              fi
+            fi
+          fi
+        fi
+        
+        # Add enriched item to array
+        ENRICHED_ITEMS=$(echo "$ENRICHED_ITEMS" | jq --argjson item "$ITEM" '. + [$item]')
+      done
+      
+      # Replace issues in filtered response with enriched items
+      FILTERED_RESPONSE=$(echo "$FILTERED_RESPONSE" | jq --argjson items "$ENRICHED_ITEMS" '.issues = $items')
+    fi
     
     # Display each issue with all available details
     ISSUE_COUNT=$(echo "$FILTERED_RESPONSE" | jq -r '.issues | length // 0')
@@ -585,52 +645,94 @@ if command -v jq &> /dev/null; then
       fi
       echo "---"
       
-      # Display all available fields
+      # Display all available fields with aligned values
       if [ "$IS_HOTSPOT" = "true" ]; then
         # Display hotspot-specific fields
-        echo "$ITEM" | jq -r '
-          "Key:              \(.key // "N/A")
-Severity:          \((.vulnerabilityProbability // .severity // "N/A") | ascii_upcase)
-Type:              SECURITY_HOTSPOT
-Status:            \(.status // "N/A")
-Rule:              \(.ruleKey // .rule // "N/A")
-Component:         \(.component // "N/A")
-Project:           \(.project // "N/A")
-Line:              \(.line // "N/A")
-Message:           \(.message // "N/A")
-Author:            \(.author // "N/A")
-Creation Date:     \(.creationDate // "N/A")
-Update Date:       \(.updateDate // "N/A")"
-        '
+        KEY=$(echo "$ITEM" | jq -r '.key // "N/A"')
+        SEVERITY=$(echo "$ITEM" | jq -r '(.vulnerabilityProbability // .severity // "N/A") | ascii_upcase')
+        STATUS=$(echo "$ITEM" | jq -r '.status // "N/A"')
+        RULE=$(echo "$ITEM" | jq -r '.ruleKey // .rule // "N/A"')
+        COMPONENT=$(echo "$ITEM" | jq -r '.component // "N/A"')
+        PROJECT=$(echo "$ITEM" | jq -r '.project // "N/A"')
+        LINE=$(echo "$ITEM" | jq -r '.line // "N/A"')
+        MESSAGE=$(echo "$ITEM" | jq -r '.message // "N/A"')
+        AUTHOR=$(echo "$ITEM" | jq -r '.author // "N/A"')
+        CREATION_DATE=$(echo "$ITEM" | jq -r '.creationDate // "N/A"')
+        UPDATE_DATE=$(echo "$ITEM" | jq -r '.updateDate // "N/A"')
+        
+        printf "Key:              %s\n" "$KEY"
+        printf "Severity:         %s\n" "$SEVERITY"
+        printf "Type:             %s\n" "SECURITY_HOTSPOT"
+        printf "Status:           %s\n" "$STATUS"
+        printf "Rule:             %s\n" "$RULE"
+        printf "Component:        %s\n" "$COMPONENT"
+        printf "Project:          %s\n" "$PROJECT"
+        printf "Line:             %s\n" "$LINE"
+        printf "Author:           %s\n" "$AUTHOR"
+        printf "Creation Date:    %s\n" "$CREATION_DATE"
+        printf "Update Date:      %s\n" "$UPDATE_DATE"
+        
+        # Display message with same pattern as body content in PR comments script
+        if [ -n "$MESSAGE" ] && [ "$MESSAGE" != "N/A" ] && [ "$MESSAGE" != "" ]; then
+          echo "Message:"
+          echo ""
+          echo "$MESSAGE" | sed 's/^/                   /'
+          echo ""
+        fi
       else
         # Display issue fields
-        echo "$ITEM" | jq -r '
-          "Key:              \(.key // "N/A")
-Severity:          \((.severity // "N/A") | ascii_upcase)
-Type:              \(.type // "N/A")
-Status:            \(.status // "N/A")
-Rule:              \(.rule // "N/A")
-Component:         \(.component // "N/A")
-Project:           \(.project // "N/A")
-Line:              \(.line // "N/A")
-Message:           \(.message // "N/A")
-Author:            \(.author // "N/A")
-Creation Date:     \(.creationDate // "N/A")
-Update Date:       \(.updateDate // "N/A")
-Resolution:        \(.resolution // "N/A")
-Effort:            \(.effort // "N/A")
-Debt:              \(.debt // "N/A")"
-        '
+        KEY=$(echo "$ITEM" | jq -r '.key // "N/A"')
+        SEVERITY=$(echo "$ITEM" | jq -r '(.severity // "N/A") | ascii_upcase')
+        TYPE=$(echo "$ITEM" | jq -r '.type // "N/A"')
+        STATUS=$(echo "$ITEM" | jq -r '.status // "N/A"')
+        RULE=$(echo "$ITEM" | jq -r '.rule // "N/A"')
+        COMPONENT=$(echo "$ITEM" | jq -r '.component // "N/A"')
+        PROJECT=$(echo "$ITEM" | jq -r '.project // "N/A"')
+        LINE=$(echo "$ITEM" | jq -r '.line // "N/A"')
+        MESSAGE=$(echo "$ITEM" | jq -r '.message // "N/A"')
+        AUTHOR=$(echo "$ITEM" | jq -r '.author // "N/A"')
+        CREATION_DATE=$(echo "$ITEM" | jq -r '.creationDate // "N/A"')
+        UPDATE_DATE=$(echo "$ITEM" | jq -r '.updateDate // "N/A"')
+        RESOLUTION=$(echo "$ITEM" | jq -r '.resolution // "N/A"')
+        EFFORT=$(echo "$ITEM" | jq -r '.effort // "N/A"')
+        DEBT=$(echo "$ITEM" | jq -r '.debt // "N/A"')
+        
+        printf "Key:              %s\n" "$KEY"
+        printf "Severity:         %s\n" "$SEVERITY"
+        printf "Type:             %s\n" "$TYPE"
+        printf "Status:           %s\n" "$STATUS"
+        printf "Rule:             %s\n" "$RULE"
+        printf "Component:        %s\n" "$COMPONENT"
+        printf "Project:          %s\n" "$PROJECT"
+        printf "Line:             %s\n" "$LINE"
+        printf "Author:           %s\n" "$AUTHOR"
+        printf "Creation Date:    %s\n" "$CREATION_DATE"
+        printf "Update Date:      %s\n" "$UPDATE_DATE"
+        printf "Resolution:       %s\n" "$RESOLUTION"
+        printf "Effort:           %s\n" "$EFFORT"
+        printf "Debt:             %s\n" "$DEBT"
+        
+        # Display message with same pattern as body content in PR comments script
+        if [ -n "$MESSAGE" ] && [ "$MESSAGE" != "N/A" ] && [ "$MESSAGE" != "" ]; then
+          echo "Message:"
+          echo ""
+          echo "$MESSAGE" | sed 's/^/                   /'
+          echo ""
+        fi
       fi
       
       # Display text range if available
       TEXT_RANGE=$(echo "$ITEM" | jq '.textRange // empty')
       if [ -n "$TEXT_RANGE" ] && [ "$TEXT_RANGE" != "null" ]; then
+        START_LINE=$(echo "$ITEM" | jq -r '.textRange.startLine // "N/A"')
+        START_OFFSET=$(echo "$ITEM" | jq -r '.textRange.startOffset // "N/A"')
+        END_LINE=$(echo "$ITEM" | jq -r '.textRange.endLine // "N/A"')
+        END_OFFSET=$(echo "$ITEM" | jq -r '.textRange.endOffset // "N/A"')
         echo "Text Range:"
-        echo "$ITEM" | jq -r '.textRange | "  Start Line:   \(.startLine // "N/A")
-  Start Offset:  \(.startOffset // "N/A")
-  End Line:      \(.endLine // "N/A")
-  End Offset:    \(.endOffset // "N/A")"'
+        printf "  Start Line:     %s\n" "$START_LINE"
+        printf "  Start Offset:   %s\n" "$START_OFFSET"
+        printf "  End Line:       %s\n" "$END_LINE"
+        printf "  End Offset:     %s\n" "$END_OFFSET"
       fi
       
       # Display flows if available (for multi-location issues)
@@ -640,14 +742,85 @@ Debt:              \(.debt // "N/A")"
         echo "$ITEM" | jq -r '.flows[] | "  Flow with \(.locations | length) locations"'
       fi
       
+      # Display detailed information if available (from detail API call)
+      if [ "$FETCH_DETAILS" = "true" ]; then
+        # For hotspots, display risk and fix guidance
+        if [ "$IS_HOTSPOT" = "true" ]; then
+          # Try various possible field names for risk description
+          RISK_DESCRIPTION=$(echo "$ITEM" | jq -r '.riskDescription // .message // .rule.description // empty' 2>/dev/null)
+          VULNERABILITY_DESCRIPTION=$(echo "$ITEM" | jq -r '.vulnerabilityDescription // .rule.vulnerabilityDescription // empty' 2>/dev/null)
+          FIX_RECOMMENDATIONS=$(echo "$ITEM" | jq -r '.fixRecommendations // .rule.fixRecommendations // .rule.remediation.func // empty' 2>/dev/null)
+          RULE_DESCRIPTION=$(echo "$ITEM" | jq -r '.rule.description // .rule.htmlDescription // empty' 2>/dev/null)
+          
+          if [ -n "$RULE_DESCRIPTION" ] && [ "$RULE_DESCRIPTION" != "null" ] && [ "$RULE_DESCRIPTION" != "" ]; then
+            echo ""
+            echo "Rule Description:"
+            # Strip HTML tags if present and indent
+            echo "$RULE_DESCRIPTION" | sed 's/<[^>]*>//g' | sed 's/^/  /'
+          fi
+          
+          if [ -n "$RISK_DESCRIPTION" ] && [ "$RISK_DESCRIPTION" != "null" ] && [ "$RISK_DESCRIPTION" != "" ] && [ "$RISK_DESCRIPTION" != "$RULE_DESCRIPTION" ]; then
+            echo ""
+            echo "What's the risk?:"
+            echo "$RISK_DESCRIPTION" | sed 's/<[^>]*>//g' | sed 's/^/  /'
+          fi
+          
+          if [ -n "$VULNERABILITY_DESCRIPTION" ] && [ "$VULNERABILITY_DESCRIPTION" != "null" ] && [ "$VULNERABILITY_DESCRIPTION" != "" ]; then
+            echo ""
+            echo "Vulnerability Description:"
+            echo "$VULNERABILITY_DESCRIPTION" | sed 's/<[^>]*>//g' | sed 's/^/  /'
+          fi
+          
+          if [ -n "$FIX_RECOMMENDATIONS" ] && [ "$FIX_RECOMMENDATIONS" != "null" ] && [ "$FIX_RECOMMENDATIONS" != "" ]; then
+            echo ""
+            echo "How can I fix it?:"
+            echo "$FIX_RECOMMENDATIONS" | sed 's/<[^>]*>//g' | sed 's/^/  /'
+          fi
+        else
+          # For issues, display rule description, "Why is this an issue?", and other details
+          RULE_DESCRIPTION=$(echo "$ITEM" | jq -r '.rule.description // .rule.htmlDescription // .ruleDescription // empty' 2>/dev/null)
+          RULE_NAME=$(echo "$ITEM" | jq -r '.rule.name // empty' 2>/dev/null)
+          WHY_IS_THIS_AN_ISSUE=$(echo "$ITEM" | jq -r '.rule.whyIsThisAnIssue // .whyIsThisAnIssue // .rule.htmlNote // .rule.note // empty' 2>/dev/null)
+          HOW_TO_FIX_IT=$(echo "$ITEM" | jq -r '.rule.howToFixIt // .howToFixIt // .rule.remediation.func // empty' 2>/dev/null)
+          
+          if [ -n "$RULE_NAME" ] && [ "$RULE_NAME" != "null" ] && [ "$RULE_NAME" != "" ]; then
+            echo ""
+            echo "Rule Name:"
+            echo "  $RULE_NAME"
+          fi
+          
+          if [ -n "$RULE_DESCRIPTION" ] && [ "$RULE_DESCRIPTION" != "null" ] && [ "$RULE_DESCRIPTION" != "" ]; then
+            echo ""
+            echo "Rule Description:"
+            # Strip HTML tags if present and indent
+            echo "$RULE_DESCRIPTION" | sed 's/<[^>]*>//g' | sed 's/^/  /'
+          fi
+          
+          if [ -n "$WHY_IS_THIS_AN_ISSUE" ] && [ "$WHY_IS_THIS_AN_ISSUE" != "null" ] && [ "$WHY_IS_THIS_AN_ISSUE" != "" ]; then
+            echo ""
+            echo "Why is this an issue?:"
+            # Strip HTML tags if present and indent
+            echo "$WHY_IS_THIS_AN_ISSUE" | sed 's/<[^>]*>//g' | sed 's/^/  /'
+          fi
+          
+          if [ -n "$HOW_TO_FIX_IT" ] && [ "$HOW_TO_FIX_IT" != "null" ] && [ "$HOW_TO_FIX_IT" != "" ]; then
+            echo ""
+            echo "How can I fix it?:"
+            # Strip HTML tags if present and indent
+            echo "$HOW_TO_FIX_IT" | sed 's/<[^>]*>//g' | sed 's/^/  /'
+          fi
+        fi
+      fi
+      
       # Display URL
       ITEM_KEY=$(echo "$ITEM" | jq -r '.key')
       ITEM_PROJECT=$(echo "$ITEM" | jq -r '.project // "'${PROJECT_KEY}'"')
       if [ "$IS_HOTSPOT" = "true" ]; then
-        echo "URL:              ${SONAR_HOST}security_hotspots?id=${ITEM_PROJECT}&hotspots=${ITEM_KEY}"
+        URL="${SONAR_HOST}security_hotspots?id=${ITEM_PROJECT}&hotspots=${ITEM_KEY}"
       else
-        echo "URL:              ${SONAR_HOST}project/issues?id=${ITEM_PROJECT}&issues=${ITEM_KEY}&open=${ITEM_KEY}"
+        URL="${SONAR_HOST}project/issues?id=${ITEM_PROJECT}&issues=${ITEM_KEY}&open=${ITEM_KEY}"
       fi
+      printf "URL:              %s\n" "$URL"
       echo ""
       done
     else
@@ -657,6 +830,27 @@ Debt:              \(.debt // "N/A")"
         echo "No security hotspots found."
       else
         echo "No issues found."
+      fi
+    fi
+    
+    # Display summary at the end
+    echo ""
+    echo "=== Summary ==="
+    if [ -n "$ISSUE_KEY" ]; then
+      if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
+        echo "Total items found: $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
+      elif [ "$FETCH_HOTSPOTS" = "true" ]; then
+        echo "Total security hotspots found: $HOTSPOTS_TOTAL"
+      else
+        echo "Total issues found: $ISSUES_TOTAL"
+      fi
+    else
+      if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
+        echo "Total items for project '${PROJECT_KEY}': $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
+      elif [ "$FETCH_HOTSPOTS" = "true" ]; then
+        echo "Total security hotspots for project '${PROJECT_KEY}': $HOTSPOTS_TOTAL"
+      else
+        echo "Total issues for project '${PROJECT_KEY}': $ISSUES_TOTAL"
       fi
     fi
   fi
