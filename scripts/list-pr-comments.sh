@@ -20,9 +20,19 @@ COMMENT_URL=""
 USER_FILTER="all"
 COMMENT_TYPE="all"
 PATH_FILTER=""
-SHOW_RESOLVED=""
+BODY_CONTAINS_STRING=""
+SHOW_HIDDEN=""
 JSON_OUTPUT=""
 COUNT_ONLY=""
+COMMENT_ID=""
+ACTION_HIDE=""
+ACTION_RESOLVE=""
+ACTION_REPLY=""
+HIDE_REASON=""
+REPLY_TEXT=""
+NO_PROMPT=""
+GET_HIDE_REASONS=""
+EFFICIENCY_TIP=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -59,8 +69,46 @@ while [[ $# -gt 0 ]]; do
       PATH_FILTER="$2"
       shift 2
       ;;
-    --show-resolved)
-      SHOW_RESOLVED="1"
+    --show-hidden)
+      SHOW_HIDDEN="1"
+      shift
+      ;;
+    --body-contains-string)
+      BODY_CONTAINS_STRING="$2"
+      shift 2
+      ;;
+    -c|--comment-id)
+      COMMENT_ID="$2"
+      shift 2
+      ;;
+    --hide)
+      ACTION_HIDE="1"
+      shift
+      ;;
+    --resolve)
+      ACTION_RESOLVE="1"
+      shift
+      ;;
+    --reply)
+      ACTION_REPLY="1"
+      # Check if next argument is provided and doesn't start with -
+      if [ $# -gt 1 ] && [[ ! "$2" =~ ^- ]]; then
+        REPLY_TEXT="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --reason)
+      HIDE_REASON="$2"
+      shift 2
+      ;;
+    --no-prompt)
+      NO_PROMPT="1"
+      shift
+      ;;
+    --get-hide-reasons)
+      GET_HIDE_REASONS="1"
       shift
       ;;
     -h|--help)
@@ -69,6 +117,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  -pr, --pull-request <number>  Filter comments for a specific pull request"
       echo "  -u, --url <url>               Get a specific comment by URL"
+      echo "  -c, --comment-id <id>         Comment ID to use (required for actions, optional for listing)"
       echo "  --bots                        Show only bot comments"
       echo "  --humans                      Show only human comments"
       echo "  -t, --type <type>            Filter by comment type: all, review, issue (default: all)"
@@ -77,23 +126,27 @@ while [[ $# -gt 0 ]]; do
       echo "                               - issue: PR conversation comments"
       echo "  -p, --path <path>             Filter review comments by file path (exact match)"
       echo "                               Note: Only applies to review comments, not issue comments"
-      echo "  --show-resolved               Show resolved comments (default: only unresolved)"
+      echo "  --body-contains-string <str>  Filter comments by body text (exact substring match)"
+      echo "  --show-hidden                 Show hidden/resolved comments (default: hide both)"
       echo "  --json                        Output only JSON (no formatted text)"
       echo "  --count                       Output only the count of items"
-      echo "  -h, --help                    Show this help message"
       echo ""
-      echo "Examples:"
-      echo "  $0 -pr 19                     List all comments for PR #19 (default: all users)"
-      echo "  $0 -pr 19 --bots              List only bot comments for PR #19"
-      echo "  $0 -pr 19 --humans            List only human comments for PR #19"
-      echo "  $0 -pr 19 -t review           List only inline review comments"
-      echo "  $0 -pr 19 -p src/utils.ts     List comments for a specific file path"
-      echo "  $0 -pr 19 --show-resolved     List all comments including resolved ones"
-      echo "  $0 -u <comment-url>           Get details for a specific comment by URL"
-      echo "  $0 --json                     Output only JSON format"
-      echo "  $0 -pr 19 --json              Output JSON for PR #19 comments"
-      echo "  $0 --count                    Output only the count"
-      echo "  $0 -pr 19 --humans --count    Output count of human comments for PR #19"
+      echo "Actions (can be combined - --reply and --resolve can be used together):"
+      echo "  --hide                        Hide an issue comment"
+      echo "  --resolve                     Resolve a review comment thread"
+      echo "  --reply [text]                Reply to a review comment"
+      echo "                               If text is provided, use it; otherwise prompt interactively"
+      echo "                               Can be combined with --resolve (reply first, then resolve)"
+      echo ""
+      echo "Action Options:"
+      echo "  --reason <reason>             Reason for hiding (used with --hide)"
+      echo "                               Must be one of the valid reasons from GitHub API"
+      echo "                               Use --get-hide-reasons to see available options"
+      echo "                               (prompts if not provided or invalid)"
+      echo "  --get-hide-reasons            Display valid hide reason options from GitHub API"
+      echo "  --no-prompt                   Skip interactive prompts (fail if required info missing)"
+      echo ""
+      echo "  -h, --help                    Show this help message"
       echo ""
       echo "Repository: $REPO"
       exit 0
@@ -105,6 +158,276 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Validation functions
+# Cache for valid hide reasons (fetched from API)
+VALID_HIDE_REASONS=""
+VALID_HIDE_REASONS_GRAPHQL=""
+
+# Function to build suggested command based on current arguments
+build_suggested_command() {
+  local cmd="$0"
+  
+  # Add PR number if available
+  if [ -n "$PULL_REQUEST" ]; then
+    cmd="$cmd -pr $PULL_REQUEST"
+  fi
+  
+  # Add comment ID if available
+  if [ -n "$COMMENT_ID" ]; then
+    cmd="$cmd -c $COMMENT_ID"
+  fi
+  
+  # Add comment type
+  if [ -n "$COMMENT_TYPE" ] && [ "$COMMENT_TYPE" != "all" ]; then
+    cmd="$cmd -t $COMMENT_TYPE"
+  fi
+  
+  # Add user filter
+  if [ -n "$USER_FILTER" ] && [ "$USER_FILTER" != "all" ]; then
+    if [ "$USER_FILTER" = "bots" ]; then
+      cmd="$cmd --bots"
+    elif [ "$USER_FILTER" = "humans" ]; then
+      cmd="$cmd --humans"
+    fi
+  fi
+  
+  # Add path filter
+  if [ -n "$PATH_FILTER" ]; then
+    cmd="$cmd -p \"$PATH_FILTER\""
+  fi
+  
+  # Add body contains string filter
+  if [ -n "$BODY_CONTAINS_STRING" ]; then
+    cmd="$cmd --body-contains-string \"$BODY_CONTAINS_STRING\""
+  fi
+  
+  # Add show resolved
+      if [ -n "$SHOW_HIDDEN" ]; then
+        cmd="$cmd --show-hidden"
+      fi
+  
+  # Add actions
+  if [ -n "$ACTION_HIDE" ]; then
+    cmd="$cmd --hide"
+  fi
+  if [ -n "$ACTION_RESOLVE" ]; then
+    cmd="$cmd --resolve"
+  fi
+  if [ -n "$ACTION_REPLY" ]; then
+    if [ -n "$REPLY_TEXT" ]; then
+      # Escape quotes in reply text
+      local escaped_reply=$(echo "$REPLY_TEXT" | sed "s/\"/\\\\\"/g")
+      cmd="$cmd --reply \"$escaped_reply\""
+    else
+      cmd="$cmd --reply"
+    fi
+  fi
+  
+  # Add reason if provided
+  if [ -n "$1" ]; then
+    cmd="$cmd --reason $1"
+  elif [ -n "$HIDE_REASON" ]; then
+    cmd="$cmd --reason $HIDE_REASON"
+  fi
+  
+  # Add JSON output
+  if [ -n "$JSON_OUTPUT" ]; then
+    cmd="$cmd --json"
+  fi
+  
+  echo "$cmd"
+}
+
+fetch_valid_hide_reasons() {
+  # Use GraphQL introspection to get enum values
+  # Try ReportedContentClassifiers first (used by hideIssueComment)
+  local introspection_query="{
+    __type(name: \"ReportedContentClassifiers\") {
+      enumValues {
+        name
+      }
+    }
+  }"
+  
+  local result
+  result=$(gh api graphql -f query="$introspection_query" 2>/dev/null)
+  local exit_code=$?
+  
+  if [ $exit_code -eq 0 ] && [ -n "$result" ]; then
+    # Check for errors in response
+    if echo "$result" | jq -e '.errors' >/dev/null 2>&1; then
+      # Try alternative enum name if first one fails
+      introspection_query="{
+        __type(name: \"ReportedContentClassifiers\") {
+          enumValues {
+            name
+          }
+        }
+      }"
+      result=$(gh api graphql -f query="$introspection_query" 2>/dev/null)
+      exit_code=$?
+    fi
+    
+    if [ $exit_code -eq 0 ] && [ -n "$result" ] && ! echo "$result" | jq -e '.errors' >/dev/null 2>&1; then
+      # Store GraphQL enum values (UPPER_SNAKE_CASE)
+      VALID_HIDE_REASONS_GRAPHQL=$(echo "$result" | jq -r '
+        .data.__type.enumValues[]?.name // empty |
+        select(. != null and . != "")
+      ' 2>/dev/null | tr '\n' '|' | sed 's/|$//' 2>/dev/null)
+      
+      # Extract enum values and convert GraphQL enum format to API format
+      # GraphQL uses UPPER_SNAKE_CASE, API expects lowercase-kebab-case
+      # Use jq to transform and join with pipes
+      VALID_HIDE_REASONS=$(echo "$result" | jq -r '
+        .data.__type.enumValues[]?.name // empty |
+        select(. != null and . != "") |
+        (ascii_downcase | gsub("_"; "-"))
+      ' 2>/dev/null | tr '\n' '|' | sed 's/|$//' 2>/dev/null)
+      
+      # If we got valid results, return success
+      if [ -n "$VALID_HIDE_REASONS" ] && [ "$VALID_HIDE_REASONS" != "null" ] && [ "$VALID_HIDE_REASONS" != "" ]; then
+        return 0
+      fi
+    fi
+  fi
+  
+  # API call failed or returned invalid data
+  echo "Error: Failed to fetch valid hide reasons from GitHub API" >&2
+  return 1
+}
+
+convert_reason_to_graphql() {
+  local api_reason="$1"
+  
+  # Fetch reasons if not already cached
+  if [ -z "$VALID_HIDE_REASONS" ] || [ -z "$VALID_HIDE_REASONS_GRAPHQL" ]; then
+    if ! fetch_valid_hide_reasons; then
+      echo "Error: Could not fetch valid hide reasons from GitHub API" >&2
+      return 1
+    fi
+  fi
+  
+  # Convert API format (lowercase-kebab-case) to GraphQL format (UPPER_SNAKE_CASE)
+  # Match by position in the arrays
+  local IFS='|'
+  local api_reasons_list
+  local graphql_reasons_list
+  api_reasons_list=$VALID_HIDE_REASONS
+  graphql_reasons_list=$VALID_HIDE_REASONS_GRAPHQL
+  
+  local i=1
+  for api_reason_item in $api_reasons_list; do
+    if [ "$api_reason" = "$api_reason_item" ]; then
+      # Found matching API reason, get corresponding GraphQL value
+      local j=1
+      for graphql_reason_item in $graphql_reasons_list; do
+        if [ "$i" -eq "$j" ]; then
+          echo "$graphql_reason_item"
+          return 0
+        fi
+        j=$((j + 1))
+      done
+    fi
+    i=$((i + 1))
+  done
+  
+  # If not found, try direct conversion as fallback
+  echo "$api_reason" | tr '[:lower:]' '[:upper:]' | tr '-' '_'
+  return 0
+}
+
+validate_hide_reason() {
+  local reason="$1"
+  
+  # Fetch reasons if not already cached
+  if [ -z "$VALID_HIDE_REASONS" ]; then
+    if ! fetch_valid_hide_reasons; then
+      return 1
+    fi
+  fi
+  
+  # Check if reason matches any valid reason (case-insensitive)
+  local reason_lower
+  reason_lower=$(echo "$reason" | tr '[:upper:]' '[:lower:]')
+  
+  # Convert pipe-separated string to check each reason
+  local IFS='|'
+  for valid_reason in $VALID_HIDE_REASONS; do
+    if [ "$reason_lower" = "$valid_reason" ]; then
+      return 0
+    fi
+  done
+  
+  return 1
+}
+
+prompt_for_reason() {
+  # Fetch reasons if not already cached
+  if [ -z "$VALID_HIDE_REASONS" ]; then
+    if ! fetch_valid_hide_reasons; then
+      echo "Error: Could not fetch valid hide reasons from GitHub API" >&2
+      return 1
+    fi
+  fi
+  
+  # Convert pipe-separated string to array and display
+  local IFS='|'
+  local reasons_list
+  reasons_list=$VALID_HIDE_REASONS
+  
+  echo "" >&2
+  echo "Select a reason for hiding the comment:" >&2
+  local i=1
+  local selected_reason=""
+  for reason in $reasons_list; do
+    echo "  $i) $reason" >&2
+    if [ "$i" -eq 1 ]; then
+      # Store first reason to initialize
+      selected_reason="$reason"
+    fi
+    i=$((i + 1))
+  done
+  
+  local max_choice=$((i - 1))
+  echo -n "Enter number (1-$max_choice): " >&2
+  if [ -t 0 ]; then
+    read -r choice
+  else
+    read -r choice < /dev/tty
+  fi
+  
+  # Validate choice is a number and within range
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$max_choice" ]; then
+    echo "Error: Invalid selection" >&2
+    return 1
+  fi
+  
+  # Find and return the selected reason
+  i=1
+  for reason in $reasons_list; do
+    if [ "$i" -eq "$choice" ]; then
+      # Show the complete command the user could have run
+      if [ -z "$JSON_OUTPUT" ]; then
+        SUGGESTED_CMD=$(build_suggested_command "$reason")
+        echo "" >&2
+        EFFICIENCY_TIP="Tip: For faster execution next time, use: $SUGGESTED_CMD"
+      fi
+      echo "$reason"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  
+  echo "Error: Could not find selected reason" >&2
+  return 1
+}
+
+prompt_for_reply() {
+  echo -n "Enter reply text: "
+  read -r reply
+  echo "$reply"
+}
 
 # Validate comment type
 case "$COMMENT_TYPE" in
@@ -155,10 +478,34 @@ if ! command -v jq &> /dev/null; then
   exit 1
 fi
 
+# Handle --get-hide-reasons option
+if [ -n "$GET_HIDE_REASONS" ]; then
+  echo "Fetching valid hide reasons from GitHub API..."
+  echo ""
+  if fetch_valid_hide_reasons; then
+    echo "Valid hide reasons:"
+    IFS_SAVE="$IFS"
+    IFS='|'
+    reasons_list=$VALID_HIDE_REASONS
+    i=1
+    for reason in $reasons_list; do
+      echo "  $i) $reason"
+      i=$((i + 1))
+    done
+    IFS="$IFS_SAVE"
+    echo ""
+    echo "These values can be used with --reason when using --hide"
+  else
+    echo "Error: Could not fetch valid hide reasons from GitHub API" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
 # Initialize ALL_COMMENTS to empty array
 ALL_COMMENTS="[]"
 
-# If URL is provided, extract comment ID and fetch that specific comment
+# If URL is provided, extract comment ID (and optionally fetch that specific comment)
 if [ -n "$COMMENT_URL" ]; then
   # Parse URL to extract comment ID
   # URLs can be in formats like:
@@ -168,25 +515,33 @@ if [ -n "$COMMENT_URL" ]; then
   
   if echo "$COMMENT_URL" | grep -q "#discussion_r"; then
     # Review comment
-    COMMENT_ID=$(echo "$COMMENT_URL" | sed -E 's/.*#discussion_r([0-9]+)/\1/')
+    EXTRACTED_COMMENT_ID=$(echo "$COMMENT_URL" | sed -E 's/.*#discussion_r([0-9]+)/\1/')
     PR_NUM=$(echo "$COMMENT_URL" | sed -E 's/.*\/pull\/([0-9]+).*/\1/')
     
-    if [ -n "$COMMENT_ID" ] && [ -n "$PR_NUM" ]; then
-      if [ -z "$JSON_OUTPUT" ]; then
-        echo "Fetching review comment #${COMMENT_ID} from PR #${PR_NUM}"
+    if [ -n "$EXTRACTED_COMMENT_ID" ] && [ -n "$PR_NUM" ]; then
+      # If COMMENT_ID not set and action is specified, use extracted ID
+      if [ -z "$COMMENT_ID" ] && { [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; }; then
+        COMMENT_ID="$EXTRACTED_COMMENT_ID"
       fi
-      COMMENT=$(gh api "repos/${REPO}/pulls/comments/${COMMENT_ID}" 2>/dev/null)
-      if [ $? -eq 0 ] && [ -n "$COMMENT" ]; then
-        COMMENT_WITH_TYPE=$(echo "$COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
-        if [ $? -eq 0 ] && [ -n "$COMMENT_WITH_TYPE" ]; then
-          ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+      
+      # Only fetch comment if not performing an action (actions will fetch it themselves)
+      if [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+        if [ -z "$JSON_OUTPUT" ]; then
+          echo "Fetching review comment #${EXTRACTED_COMMENT_ID} from PR #${PR_NUM}"
+        fi
+        COMMENT=$(gh api "repos/${REPO}/pulls/comments/${EXTRACTED_COMMENT_ID}" 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$COMMENT" ]; then
+          COMMENT_WITH_TYPE=$(echo "$COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$COMMENT_WITH_TYPE" ]; then
+            ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+          else
+            echo "Error: Could not process comment #${EXTRACTED_COMMENT_ID}"
+            exit 1
+          fi
         else
-          echo "Error: Could not process comment #${COMMENT_ID}"
+          echo "Error: Could not fetch comment #${EXTRACTED_COMMENT_ID}"
           exit 1
         fi
-      else
-        echo "Error: Could not fetch comment #${COMMENT_ID}"
-        exit 1
       fi
     else
       echo "Error: Could not parse review comment ID from URL: $COMMENT_URL"
@@ -194,25 +549,40 @@ if [ -n "$COMMENT_URL" ]; then
     fi
   elif echo "$COMMENT_URL" | grep -q "#issuecomment-"; then
     # Issue comment
-    COMMENT_ID=$(echo "$COMMENT_URL" | sed -E 's/.*#issuecomment-([0-9]+)/\1/')
+    EXTRACTED_COMMENT_ID=$(echo "$COMMENT_URL" | sed -E 's/.*#issuecomment-([0-9]+)/\1/')
     PR_NUM=$(echo "$COMMENT_URL" | sed -E 's/.*\/pull\/([0-9]+).*/\1/')
     
-    if [ -n "$COMMENT_ID" ] && [ -n "$PR_NUM" ]; then
-      if [ -z "$JSON_OUTPUT" ]; then
-        echo "Fetching issue comment #${COMMENT_ID} from PR #${PR_NUM}"
+    if [ -n "$EXTRACTED_COMMENT_ID" ] && [ -n "$PR_NUM" ]; then
+      # If COMMENT_ID not set and action is specified, use extracted ID
+      if [ -z "$COMMENT_ID" ] && { [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; }; then
+        COMMENT_ID="$EXTRACTED_COMMENT_ID"
       fi
-      COMMENT=$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null)
-      if [ $? -eq 0 ] && [ -n "$COMMENT" ]; then
-        COMMENT_WITH_TYPE=$(echo "$COMMENT" | jq '. + {type: "issue"}' 2>/dev/null)
-        if [ $? -eq 0 ] && [ -n "$COMMENT_WITH_TYPE" ]; then
-          ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+      
+      # Only fetch comment if not performing an action (actions will fetch it themselves)
+      if [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+        if [ -z "$JSON_OUTPUT" ]; then
+          echo "Fetching issue comment #${EXTRACTED_COMMENT_ID} from PR #${PR_NUM}"
+        fi
+        COMMENT=$(gh api "repos/${REPO}/issues/comments/${EXTRACTED_COMMENT_ID}" 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$COMMENT" ]; then
+          # Map REST API fields to match GraphQL format
+          COMMENT_WITH_TYPE=$(echo "$COMMENT" | jq '
+            . + {
+              type: "issue",
+              isMinimized: (if .hidden == true then true else false end),
+              minimizedReason: (if .hidden_reason then (.hidden_reason | ascii_downcase | gsub("_"; "-")) else null end)
+            }
+          ' 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$COMMENT_WITH_TYPE" ]; then
+            ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+          else
+            echo "Error: Could not process comment #${EXTRACTED_COMMENT_ID}"
+            exit 1
+          fi
         else
-          echo "Error: Could not process comment #${COMMENT_ID}"
+          echo "Error: Could not fetch comment #${EXTRACTED_COMMENT_ID}"
           exit 1
         fi
-      else
-        echo "Error: Could not fetch comment #${COMMENT_ID}"
-        exit 1
       fi
     else
       echo "Error: Could not parse issue comment ID from URL: $COMMENT_URL"
@@ -238,9 +608,141 @@ fi
 
 # If we have a PR number (from -pr flag or extracted from URL), fetch all comments
 # Condition: PR is set AND (no URL provided OR URL is just a PR URL without comment anchor)
+# Exception: If both -pr and -c are provided, fetch just that comment via GraphQL (skip REST call)
 SHOULD_FETCH_PR=false
 if [ -n "$PULL_REQUEST" ]; then
-  if [ -z "$COMMENT_URL" ]; then
+  # If both PR and COMMENT_ID are provided (without action), fetch just that comment via GraphQL
+  if [ -n "$COMMENT_ID" ] && [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+    if [ -z "$JSON_OUTPUT" ]; then
+      echo "Fetching comment #${COMMENT_ID} from PR #${PULL_REQUEST}..."
+    fi
+    
+    OWNER=$(echo "$REPO" | cut -d'/' -f1)
+    REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+    COMMENT_WITH_TYPE=""
+    
+    # Try as review comment first
+    REVIEW_QUERY="{
+      repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+        pullRequest(number: $PULL_REQUEST) {
+          reviewThreads(first: 100) {
+            nodes {
+              comments(first: 100) {
+                nodes {
+                  databaseId
+                  id
+                  bodyText
+                  path
+                  line
+                  diffHunk
+                  createdAt
+                  updatedAt
+                  author {
+                    login
+                    ... on Bot {
+                      id
+                    }
+                  }
+                  url
+                }
+              }
+            }
+          }
+        }
+      }
+    }"
+    REVIEW_DATA=$(gh api graphql -f query="$REVIEW_QUERY" 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$REVIEW_DATA" ]; then
+      COMMENT_WITH_TYPE=$(echo "$REVIEW_DATA" | jq --arg id "$COMMENT_ID" --arg pr "$PULL_REQUEST" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+        .data.repository.pullRequest.reviewThreads.nodes[].comments.nodes[] |
+        select(.databaseId == ($id | tonumber)) |
+        {
+          id: .databaseId,
+          node_id: .id,
+          body: .bodyText,
+          path: .path,
+          line: .line,
+          diff_hunk: .diffHunk,
+          created_at: .createdAt,
+          updated_at: .updatedAt,
+          user: {
+            login: .author.login,
+            type: (if (.author | has("id")) then "Bot" else "User" end)
+          },
+          html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#discussion_r\(.databaseId)"),
+          url: .url,
+          type: "review"
+        }
+      ' 2>/dev/null)
+      if [ -n "$COMMENT_WITH_TYPE" ] && [ "$COMMENT_WITH_TYPE" != "null" ]; then
+        ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+        SHOULD_FETCH_PR=false
+      else
+        COMMENT_WITH_TYPE=""
+      fi
+    fi
+    
+    # If not found as review comment, try as issue comment
+    if [ -z "$COMMENT_WITH_TYPE" ] || [ "$COMMENT_WITH_TYPE" = "null" ]; then
+      ISSUE_QUERY="{
+        repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $PULL_REQUEST) {
+            comments(first: 100) {
+              nodes {
+                databaseId
+                id
+                bodyText
+                createdAt
+                updatedAt
+                author {
+                  login
+                  ... on Bot {
+                    id
+                  }
+                }
+                url
+                isMinimized
+                minimizedReason
+              }
+            }
+          }
+        }
+      }"
+      ISSUE_DATA=$(gh api graphql -f query="$ISSUE_QUERY" 2>/dev/null)
+      if [ $? -eq 0 ] && [ -n "$ISSUE_DATA" ]; then
+        COMMENT_WITH_TYPE=$(echo "$ISSUE_DATA" | jq --arg id "$COMMENT_ID" --arg pr "$PULL_REQUEST" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+          .data.repository.pullRequest.comments.nodes[] |
+          select(.databaseId == ($id | tonumber)) |
+          {
+            id: .databaseId,
+            node_id: .id,
+            body: .bodyText,
+            created_at: .createdAt,
+            updated_at: .updatedAt,
+            user: {
+              login: .author.login,
+              type: (if (.author | has("id")) then "Bot" else "User" end)
+            },
+            html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#issuecomment-\(.databaseId)"),
+            url: .url,
+            isMinimized: (if .isMinimized then true else false end),
+            minimizedReason: (if .minimizedReason then (.minimizedReason | ascii_downcase | gsub("_"; "-")) else null end),
+            type: "issue"
+          }
+        ' 2>/dev/null)
+        if [ -n "$COMMENT_WITH_TYPE" ] && [ "$COMMENT_WITH_TYPE" != "null" ]; then
+          ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+          SHOULD_FETCH_PR=false
+        else
+          echo "Error: Comment #${COMMENT_ID} not found in PR #${PULL_REQUEST}" >&2
+          exit 1
+        fi
+      else
+        echo "Error: Failed to fetch comment via GraphQL" >&2
+        exit 1
+      fi
+    fi
+  elif [ -z "$COMMENT_URL" ]; then
     SHOULD_FETCH_PR=true
   elif echo "$COMMENT_URL" | grep -q "/pull/" && ! echo "$COMMENT_URL" | grep -q "#"; then
     SHOULD_FETCH_PR=true
@@ -248,11 +750,13 @@ if [ -n "$PULL_REQUEST" ]; then
 fi
 
 if [ "$SHOULD_FETCH_PR" = "true" ]; then
-  if [ -z "$JSON_OUTPUT" ]; then
-    echo "Fetching comments for PR #${PULL_REQUEST} in ${REPO}"
-  fi
+  # Skip fetching comments if we're only performing actions (no listing needed)
+  if [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+    if [ -z "$JSON_OUTPUT" ]; then
+      echo "Fetching comments for PR #${PULL_REQUEST} in ${REPO}"
+    fi
   
-  # Extract owner and repo from REPO variable for GraphQL queries
+    # Extract owner and repo from REPO variable for GraphQL queries
   OWNER=$(echo "$REPO" | cut -d'/' -f1)
   REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
   
@@ -304,6 +808,8 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
                 }
               }
               url
+              isMinimized
+              minimizedReason
             }
           }
         }
@@ -357,6 +863,8 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
         
         # Extract issue comments
         if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "issue" ]; then
+          # Note: GitHub GraphQL API doesn't support replyTo field for issue comments
+          # Replies would need to be identified through other means (e.g., REST API or content analysis)
           ISSUE_COMMENTS=$(echo "$GRAPHQL_RESPONSE" | jq --arg pr "$PULL_REQUEST" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
             .data.repository.pullRequest.comments.nodes[] |
             {
@@ -370,7 +878,10 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
                 type: (if (.author | has("id")) then "Bot" else "User" end)
               },
               html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#issuecomment-\(.databaseId)"),
-              url: .url
+              url: .url,
+              isMinimized: (if .isMinimized then true else false end),
+              minimizedReason: (if .minimizedReason then (.minimizedReason | ascii_downcase | gsub("_"; "-")) else null end),
+              replies: []
             }
           ' 2>/dev/null | jq -s '.' 2>/dev/null || echo "[]")
           
@@ -398,18 +909,19 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
   
   if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "review" ]; then
     if [ -n "$REVIEW_COMMENTS" ] && [ "$REVIEW_COMMENTS" != "[]" ]; then
-      if [ -n "$PATH_FILTER" ] && [ -n "$SHOW_RESOLVED" ]; then
-        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg path "$PATH_FILTER" '
+      if [ -n "$PATH_FILTER" ] && [ -n "$SHOW_HIDDEN" ]; then
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg path "$PATH_FILTER" --arg body_str "$BODY_CONTAINS_STRING" '
           [.[] | 
             if $filter == "bots" then select(.user.type == "Bot")
             elif $filter == "humans" then select(.user.type != "Bot")
             else .
             end |
             select(.path == $path) |
+            if $body_str != "" then select((.body // "") | contains($body_str)) else . end |
             . + {type: "review"}]
         ' 2>/dev/null)
-      elif [ -n "$PATH_FILTER" ] && [ -z "$SHOW_RESOLVED" ]; then
-        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg path "$PATH_FILTER" '
+      elif [ -n "$PATH_FILTER" ] && [ -z "$SHOW_HIDDEN" ]; then
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg path "$PATH_FILTER" --arg body_str "$BODY_CONTAINS_STRING" '
           [.[] | 
             if $filter == "bots" then select(.user.type == "Bot")
             elif $filter == "humans" then select(.user.type != "Bot")
@@ -417,25 +929,28 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
             end |
             select(.path == $path) |
             select(.isResolved != true) |
+            if $body_str != "" then select((.body // "") | contains($body_str)) else . end |
             . + {type: "review"}]
         ' 2>/dev/null)
-      elif [ -n "$SHOW_RESOLVED" ]; then
-        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" '
+      elif [ -n "$SHOW_HIDDEN" ]; then
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg body_str "$BODY_CONTAINS_STRING" '
           [.[] | 
             if $filter == "bots" then select(.user.type == "Bot")
             elif $filter == "humans" then select(.user.type != "Bot")
             else .
-            end | 
+            end |
+            if $body_str != "" then select((.body // "") | contains($body_str)) else . end |
             . + {type: "review"}]
         ' 2>/dev/null)
       else
-        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" '
+        REVIEW_FILTERED=$(echo "$REVIEW_COMMENTS" | jq --arg filter "$USER_FILTER" --arg body_str "$BODY_CONTAINS_STRING" '
           [.[] | 
             if $filter == "bots" then select(.user.type == "Bot")
             elif $filter == "humans" then select(.user.type != "Bot")
             else .
             end |
             select(.isResolved != true) |
+            if $body_str != "" then select((.body // "") | contains($body_str)) else . end |
             . + {type: "review"}]
         ' 2>/dev/null)
       fi
@@ -456,14 +971,28 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
   
   if [ "$COMMENT_TYPE" = "all" ] || [ "$COMMENT_TYPE" = "issue" ]; then
     if [ -n "$ISSUE_COMMENTS" ] && [ "$ISSUE_COMMENTS" != "[]" ]; then
-      ISSUE_FILTERED=$(echo "$ISSUE_COMMENTS" | jq --arg filter "$USER_FILTER" '
-        [.[] | 
-          if $filter == "bots" then select(.user.type == "Bot")
-          elif $filter == "humans" then select(.user.type != "Bot")
-          else .
-          end | 
-          . + {type: "issue"}]
-      ' 2>/dev/null)
+      if [ -n "$SHOW_HIDDEN" ]; then
+        ISSUE_FILTERED=$(echo "$ISSUE_COMMENTS" | jq --arg filter "$USER_FILTER" --arg body_str "$BODY_CONTAINS_STRING" '
+          [.[] | 
+            if $filter == "bots" then select(.user.type == "Bot")
+            elif $filter == "humans" then select(.user.type != "Bot")
+            else .
+            end |
+            if $body_str != "" then select((.bodyText // .body // "") | contains($body_str)) else . end |
+            . + {type: "issue"}]
+        ' 2>/dev/null)
+      else
+        ISSUE_FILTERED=$(echo "$ISSUE_COMMENTS" | jq --arg filter "$USER_FILTER" --arg body_str "$BODY_CONTAINS_STRING" '
+          [.[] | 
+            if $filter == "bots" then select(.user.type == "Bot")
+            elif $filter == "humans" then select(.user.type != "Bot")
+            else .
+            end |
+            select(.isMinimized != true) |
+            if $body_str != "" then select((.bodyText // .body // "") | contains($body_str)) else . end |
+            . + {type: "issue"}]
+        ' 2>/dev/null)
+      fi
       if [ $? -eq 0 ] && [ -n "$ISSUE_FILTERED" ]; then
         FILTERED_COUNT=$(echo "$ISSUE_FILTERED" | jq 'length' 2>/dev/null || echo "0")
         if [ "$FILTERED_COUNT" -gt 0 ]; then
@@ -478,9 +1007,694 @@ if [ "$SHOULD_FETCH_PR" = "true" ]; then
       fi
     fi
   fi
+  fi
 elif [ -z "$PULL_REQUEST" ] && [ -z "$COMMENT_URL" ]; then
-  echo "Error: Either pull request number (-pr) or comment URL (-u) is required"
+  # Only require PR/URL if we're not doing an action (hide/resolve/reply) and no comment ID for viewing
+  if [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+    # If COMMENT_ID is provided without an action, try to fetch and display the comment
+    if [ -n "$COMMENT_ID" ]; then
+      if [ -z "$JSON_OUTPUT" ]; then
+        echo "Fetching comment #${COMMENT_ID}..."
+      fi
+      
+      # Try to fetch as review comment first
+      COMMENT=$(gh api "repos/${REPO}/pulls/comments/${COMMENT_ID}" 2>/dev/null)
+      if [ $? -eq 0 ] && [ -n "$COMMENT" ]; then
+        COMMENT_WITH_TYPE=$(echo "$COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$COMMENT_WITH_TYPE" ]; then
+          ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+        else
+          echo "Error: Could not process comment #${COMMENT_ID}"
+          exit 1
+        fi
+      else
+        # Try as issue comment - use REST API only to get PR number, then GraphQL for everything
+        COMMENT_REST=$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$COMMENT_REST" ]; then
+          # Get PR number from comment (minimal REST call just for PR number)
+          PR_NUM=$(echo "$COMMENT_REST" | jq -r '.issue_url // ""' 2>/dev/null | sed -E 's|.*/issues/([0-9]+).*|\1|' 2>/dev/null)
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "null" ]; then
+            PR_NUM=$(echo "$COMMENT_REST" | jq -r '.pull_request_url // ""' 2>/dev/null | sed -E 's|.*/pulls/([0-9]+).*|\1|' 2>/dev/null)
+          fi
+          
+          # Suggest more efficient command if PR number was found
+          if [ -n "$PR_NUM" ] && [ "$PR_NUM" != "null" ] && [ "$PR_NUM" != "" ]; then
+            if [ -z "$JSON_OUTPUT" ]; then
+              # Temporarily set PULL_REQUEST to build the suggested command
+              OLD_PULL_REQUEST="$PULL_REQUEST"
+              PULL_REQUEST="$PR_NUM"
+              SUGGESTED_CMD=$(build_suggested_command)
+              PULL_REQUEST="$OLD_PULL_REQUEST"
+              EFFICIENCY_TIP="Tip: For faster response, use: $SUGGESTED_CMD"
+            fi
+            # Fetch everything via GraphQL (including minimized status)
+            OWNER=$(echo "$REPO" | cut -d'/' -f1)
+            REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+            COMMENT_QUERY="{
+              repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+                pullRequest(number: $PR_NUM) {
+                  comments(first: 100) {
+                    nodes {
+                      databaseId
+                      id
+                      bodyText
+                      createdAt
+                      updatedAt
+                      author {
+                        login
+                        ... on Bot {
+                          id
+                        }
+                      }
+                      url
+                      isMinimized
+                      minimizedReason
+                    }
+                  }
+                }
+              }
+            }"
+            COMMENT_DATA=$(gh api graphql -f query="$COMMENT_QUERY" 2>/dev/null)
+            if [ $? -eq 0 ] && [ -n "$COMMENT_DATA" ]; then
+              COMMENT_WITH_TYPE=$(echo "$COMMENT_DATA" | jq --arg id "$COMMENT_ID" --arg pr "$PR_NUM" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+                .data.repository.pullRequest.comments.nodes[] |
+                select(.databaseId == ($id | tonumber)) |
+                {
+                  id: .databaseId,
+                  node_id: .id,
+                  body: .bodyText,
+                  created_at: .createdAt,
+                  updated_at: .updatedAt,
+                  user: {
+                    login: .author.login,
+                    type: (if (.author | has("id")) then "Bot" else "User" end)
+                  },
+                  html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#issuecomment-\(.databaseId)"),
+                  url: .url,
+                  isMinimized: (if .isMinimized then true else false end),
+                  minimizedReason: (if .minimizedReason then (.minimizedReason | ascii_downcase | gsub("_"; "-")) else null end),
+                  type: "issue"
+                }
+              ' 2>/dev/null)
+              if [ -n "$COMMENT_WITH_TYPE" ] && [ "$COMMENT_WITH_TYPE" != "null" ]; then
+                ALL_COMMENTS="[$COMMENT_WITH_TYPE]"
+              else
+                echo "Error: Comment #${COMMENT_ID} not found in PR #${PR_NUM}" >&2
+                exit 1
+              fi
+            else
+              echo "Error: Failed to fetch comment via GraphQL" >&2
+              exit 1
+            fi
+          else
+            echo "Error: Could not determine PR number for comment #${COMMENT_ID}" >&2
+            exit 1
+          fi
+        else
+          echo "Error: Could not fetch comment #${COMMENT_ID}"
+          echo "The comment may not exist, or you may not have access to it."
+          exit 1
+        fi
+      fi
+    else
+      echo "Error: Either pull request number (-pr), comment URL (-u), or -c/--comment-id is required"
+      echo "Use -h or --help for usage information"
+      exit 1
+    fi
+  fi
+fi
+
+# API Functions
+hide_issue_comment() {
+  local comment_id="$1"
+  local reason="$2"
+  local owner=$(echo "$REPO" | cut -d'/' -f1)
+  local repo_name=$(echo "$REPO" | cut -d'/' -f2)
+  
+  # First, get the node ID for the comment
+  local node_id
+  node_id=$(gh api "repos/${REPO}/issues/comments/${comment_id}" 2>/dev/null | jq -r '.node_id // empty' 2>/dev/null)
+  
+  if [ -z "$node_id" ] || [ "$node_id" = "null" ]; then
+    echo "Error: Could not fetch issue comment #${comment_id} or get node ID" >&2
+    return 1
+  fi
+  
+  # Execute GraphQL mutation using minimizeComment
+  local mutation="mutation {
+    minimizeComment(input: {subjectId: \"$node_id\", classifier: $reason}) {
+      minimizedComment {
+        isMinimized
+      }
+    }
+  }"
+  
+  local result
+  result=$(gh api graphql -f query="$mutation" 2>&1)
+  local exit_code=$?
+  
+  if [ $exit_code -ne 0 ]; then
+    echo "Error: Failed to hide comment: $result" >&2
+    return 1
+  fi
+  
+  # Check for errors in response
+  if echo "$result" | jq -e '.errors' >/dev/null 2>&1; then
+    echo "Error: $(echo "$result" | jq -r '.errors[0].message // "Unknown error"')" >&2
+    return 1
+  fi
+  
+  return 0
+}
+
+resolve_review_thread() {
+  local thread_id="$1"
+  
+  # Execute GraphQL mutation
+  local mutation="mutation {
+    resolveReviewThread(input: {threadId: \"$thread_id\"}) {
+      thread {
+        isResolved
+      }
+    }
+  }"
+  
+  local result
+  result=$(gh api graphql -f query="$mutation" 2>&1)
+  local exit_code=$?
+  
+  if [ $exit_code -ne 0 ]; then
+    echo "Error: Failed to resolve thread: $result" >&2
+    return 1
+  fi
+  
+  # Check for errors in response
+  if echo "$result" | jq -e '.errors' >/dev/null 2>&1; then
+    echo "Error: $(echo "$result" | jq -r '.errors[0].message // "Unknown error"')" >&2
+    return 1
+  fi
+  
+  return 0
+}
+
+reply_to_review_comment() {
+  local comment_id="$1"
+  local reply_text="$2"
+  local owner=$(echo "$REPO" | cut -d'/' -f1)
+  local repo_name=$(echo "$REPO" | cut -d'/' -f2)
+  
+  # First, get the PR number and comment details
+  local comment_data
+  comment_data=$(gh api "repos/${REPO}/pulls/comments/${comment_id}" 2>/dev/null)
+  local exit_code=$?
+  
+  if [ $exit_code -ne 0 ] || [ -z "$comment_data" ]; then
+    echo "Error: Could not fetch review comment #${comment_id}" >&2
+    return 1
+  fi
+  
+  local pr_number
+  pr_number=$(echo "$comment_data" | jq -r '.pull_request_url // ""' 2>/dev/null | sed -E 's|.*/pulls/([0-9]+).*|\1|' 2>/dev/null)
+  
+  if [ -z "$pr_number" ]; then
+    echo "Error: Could not determine PR number from comment" >&2
+    return 1
+  fi
+  
+  # Post reply
+  local reply_json
+  reply_json=$(echo "{\"body\": $(echo "$reply_text" | jq -Rs .)}" 2>/dev/null)
+  
+  local result
+  result=$(gh api "repos/${REPO}/pulls/${pr_number}/comments/${comment_id}/replies" \
+    -X POST \
+    -f body="$reply_text" 2>&1)
+  local api_exit_code=$?
+  
+  if [ $api_exit_code -ne 0 ]; then
+    echo "Error: Failed to post reply: $result" >&2
+    return 1
+  fi
+  
+  return 0
+}
+
+# Function to display a single comment (used after updates)
+display_comment() {
+  local comment_json="$1"
+  local comment_type="$2"
+  
+  if [ -z "$comment_json" ] || [ "$comment_json" = "null" ]; then
+    return 1
+  fi
+  
+  COMMENT_ID=$(echo "$comment_json" | jq -r '.id // .databaseId // "N/A"')
+  
+  echo ""
+  echo "Comment ID: $COMMENT_ID"
+  echo "---"
+  
+  # Display comment details
+  echo "$comment_json" | jq -r '
+    "Type:              \((.type // "N/A") | ascii_upcase)
+Author:            \(.user.login // .author.login // "N/A")
+Author Type:       \(.user.type // (if (.author | has("id")) then "Bot" else "User" end) // "N/A")
+Created:           \(.created_at // .createdAt // "N/A")
+Updated:           \(.updated_at // .updatedAt // "N/A")"
+  '
+  
+  # For review comments, show file and line info and resolved status
+  if [ "$comment_type" = "review" ]; then
+    echo "$comment_json" | jq -r '
+      "Path:              \(.path // "N/A")
+Line:              \(.line // "N/A")
+Diff Hunk:         \(.diff_hunk // .diffHunk // "N/A" | split("\n") | .[0:3] | join(" | "))
+Resolved:          \((if .isResolved == true then "Yes" elif .isResolved == false then "No" else "N/A" end))"
+    '
+  fi
+  
+  # For issue comments, show hidden status and reason if hidden
+  if [ "$comment_type" = "issue" ]; then
+    IS_HIDDEN=$(echo "$comment_json" | jq -r '.isMinimized // .hidden // false' 2>/dev/null)
+    if [ "$IS_HIDDEN" = "true" ]; then
+      HIDE_REASON=$(echo "$comment_json" | jq -r '.minimizedReason // .hidden_reason // "unknown"' 2>/dev/null)
+      # Convert reason format if needed
+      HIDE_REASON=$(echo "$HIDE_REASON" | tr '[:upper:]' '[:lower:]' | tr '_' '-' 2>/dev/null || echo "$HIDE_REASON")
+      echo "Hidden:              Yes"
+      echo "Hide Reason:         $HIDE_REASON"
+    fi
+  fi
+  
+  # Show comment body (truncate if very long)
+  BODY=$(echo "$comment_json" | jq -r '.body // .bodyText // ""')
+  if [ ${#BODY} -gt 500 ]; then
+    echo "Body:              ${BODY:0:500}..."
+    echo "                   (truncated, full length: ${#BODY} characters)"
+  else
+    echo "Body:"
+    echo "$BODY" | sed 's/^/                   /'
+  fi
+  
+  # Show URL
+  HTML_URL=$(echo "$comment_json" | jq -r '.html_url // .url // ""')
+  if [ -n "$HTML_URL" ] && [ "$HTML_URL" != "null" ]; then
+    echo "URL:               $HTML_URL"
+  fi
+  
+  echo ""
+}
+
+# Main Action Logic
+# Validate that comment ID is provided if an action is specified
+if { [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; } && [ -z "$COMMENT_ID" ]; then
+  echo "Error: -c/--comment-id or -u (URL) is required when using --hide, --resolve, or --reply" >&2
   exit 1
+fi
+
+# Validate action combinations
+if [ -n "$ACTION_HIDE" ] && { [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; }; then
+  echo "Error: --hide cannot be combined with --resolve or --reply" >&2
+  exit 1
+fi
+
+ACTION_ERROR=0
+
+# Reply Flow (if --reply is specified) - do this first
+if [ -n "$ACTION_REPLY" ]; then
+  if [ -z "$JSON_OUTPUT" ]; then
+    echo "Replying to review comment #${COMMENT_ID}..."
+  fi
+  
+  # Get reply text
+  final_reply_text=""
+  if [ -n "$REPLY_TEXT" ]; then
+    final_reply_text="$REPLY_TEXT"
+  elif [ -z "$NO_PROMPT" ]; then
+    final_reply_text=$(prompt_for_reply)
+    if [ -z "$final_reply_text" ]; then
+      echo "Error: Reply text cannot be empty" >&2
+      ACTION_ERROR=1
+    fi
+  else
+    echo "Error: --reply specified but no reply text provided and --no-prompt is set" >&2
+    ACTION_ERROR=1
+  fi
+  
+  if [ -n "$final_reply_text" ] && [ "$ACTION_ERROR" -eq 0 ]; then
+    if ! reply_to_review_comment "$COMMENT_ID" "$final_reply_text"; then
+      ACTION_ERROR=1
+    elif [ -z "$JSON_OUTPUT" ]; then
+      echo "Successfully posted reply to comment #${COMMENT_ID}"
+      # Show the complete command the user could have run
+      if [ -z "$REPLY_TEXT" ]; then
+        # User was prompted, show them the command with their reply
+        REPLY_TEXT="$final_reply_text"
+        SUGGESTED_CMD=$(build_suggested_command)
+        EFFICIENCY_TIP="Tip: For faster execution next time, use: $SUGGESTED_CMD"
+        REPLY_TEXT=""
+      fi
+      echo ""
+      echo "Updated comment:"
+      # Fetch updated comment with reply
+      UPDATED_COMMENT=$(gh api "repos/${REPO}/pulls/comments/${COMMENT_ID}" 2>/dev/null)
+      if [ $? -eq 0 ] && [ -n "$UPDATED_COMMENT" ]; then
+        COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
+        # Get PR number to fetch thread resolved status
+        PR_NUM=$(echo "$UPDATED_COMMENT" | jq -r '.pull_request_url // ""' 2>/dev/null | sed -E 's|.*/pulls/([0-9]+).*|\1|' 2>/dev/null)
+        if [ -n "$PR_NUM" ]; then
+          OWNER=$(echo "$REPO" | cut -d'/' -f1)
+          REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+          THREAD_QUERY="{
+            repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+              pullRequest(number: $PR_NUM) {
+                reviewThreads(first: 100) {
+                  nodes {
+                    isResolved
+                    comments(first: 100) {
+                      nodes {
+                        databaseId
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }"
+          THREAD_DATA=$(gh api graphql -f query="$THREAD_QUERY" 2>/dev/null)
+          RESOLVED_STATUS=$(echo "$THREAD_DATA" | jq -r --arg id "$COMMENT_ID" '
+            .data.repository.pullRequest.reviewThreads.nodes[] |
+            select(.comments.nodes[].databaseId == ($id | tonumber)) |
+            .isResolved
+          ' 2>/dev/null)
+          if [ -n "$RESOLVED_STATUS" ] && [ "$RESOLVED_STATUS" != "null" ]; then
+            COMMENT_WITH_TYPE=$(echo "$COMMENT_WITH_TYPE" | jq --argjson resolved "$RESOLVED_STATUS" '. + {isResolved: $resolved}' 2>/dev/null)
+          fi
+        fi
+        display_comment "$COMMENT_WITH_TYPE" "review"
+      fi
+    fi
+  fi
+fi
+
+# Hide Flow (if --hide is specified) - last step
+if [ -n "$ACTION_HIDE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
+  # Validate comment type is issue
+  comment_data=$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$comment_data" ]; then
+    echo "Error: Could not fetch comment #${COMMENT_ID} or comment does not exist" >&2
+    ACTION_ERROR=1
+  else
+    if [ -z "$JSON_OUTPUT" ]; then
+      echo "Hiding issue comment #${COMMENT_ID}..."
+    fi
+    
+    # Get reason
+    final_reason=""
+    if [ -n "$HIDE_REASON" ]; then
+      if validate_hide_reason "$HIDE_REASON"; then
+        final_reason="$HIDE_REASON"
+      else
+        echo "Error: Invalid hide reason '${HIDE_REASON}'. Valid reasons: spam, abuse, off-topic, outdated, duplicate, resolved" >&2
+        ACTION_ERROR=1
+      fi
+    elif [ -z "$NO_PROMPT" ]; then
+      final_reason=$(prompt_for_reason)
+      if [ $? -ne 0 ]; then
+        ACTION_ERROR=1
+      fi
+    else
+      echo "Error: --hide specified but --reason not provided and --no-prompt is set" >&2
+      ACTION_ERROR=1
+    fi
+    
+    if [ -n "$final_reason" ] && [ "$ACTION_ERROR" -eq 0 ]; then
+      # Convert reason to GraphQL enum format (uppercase with underscores)
+      graphql_reason=$(convert_reason_to_graphql "$final_reason")
+      if [ $? -ne 0 ] || [ -z "$graphql_reason" ]; then
+        echo "Error: Could not convert reason to GraphQL format" >&2
+        ACTION_ERROR=1
+      fi
+      
+      if [ "$ACTION_ERROR" -eq 0 ]; then
+        if ! hide_issue_comment "$COMMENT_ID" "$graphql_reason"; then
+          ACTION_ERROR=1
+        elif [ -z "$JSON_OUTPUT" ]; then
+          echo "Successfully hid comment #${COMMENT_ID} with reason: $final_reason"
+          # Show the complete command the user could have run
+          if [ -z "$HIDE_REASON" ]; then
+            # User was prompted, show them the command with their selected reason
+            SUGGESTED_CMD=$(build_suggested_command "$final_reason")
+            EFFICIENCY_TIP="Tip: For faster execution next time, use: $SUGGESTED_CMD"
+          fi
+          echo ""
+          echo "Updated comment:"
+          # Fetch updated comment via GraphQL to get minimized status
+          # First get PR number from the comment
+          PR_NUM=$(echo "$comment_data" | jq -r '.issue_url // ""' 2>/dev/null | sed -E 's|.*/issues/([0-9]+).*|\1|' 2>/dev/null)
+          if [ -z "$PR_NUM" ]; then
+            # Try alternative: get from pull_request_url if available
+            PR_NUM=$(echo "$comment_data" | jq -r '.pull_request_url // ""' 2>/dev/null | sed -E 's|.*/pulls/([0-9]+).*|\1|' 2>/dev/null)
+          fi
+          
+          if [ -n "$PR_NUM" ]; then
+            OWNER=$(echo "$REPO" | cut -d'/' -f1)
+            REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+            COMMENT_QUERY="{
+              repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+                pullRequest(number: $PR_NUM) {
+                  comments(first: 100) {
+                    nodes {
+                      databaseId
+                      id
+                      bodyText
+                      createdAt
+                      updatedAt
+                      author {
+                        login
+                        ... on Bot {
+                          id
+                        }
+                      }
+                      url
+                      isMinimized
+                      minimizedReason
+                    }
+                  }
+                }
+              }
+            }"
+            COMMENT_DATA=$(gh api graphql -f query="$COMMENT_QUERY" 2>/dev/null)
+            if [ $? -eq 0 ] && [ -n "$COMMENT_DATA" ]; then
+              COMMENT_WITH_TYPE=$(echo "$COMMENT_DATA" | jq --arg id "$COMMENT_ID" --arg pr "$PR_NUM" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+                .data.repository.pullRequest.comments.nodes[] |
+                select(.databaseId == ($id | tonumber)) |
+                {
+                  id: .databaseId,
+                  node_id: .id,
+                  body: .bodyText,
+                  created_at: .createdAt,
+                  updated_at: .updatedAt,
+                  user: {
+                    login: .author.login,
+                    type: (if (.author | has("id")) then "Bot" else "User" end)
+                  },
+                  html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#issuecomment-\(.databaseId)"),
+                  url: .url,
+                  isMinimized: (if .isMinimized then true else false end),
+                  minimizedReason: (if .minimizedReason then (.minimizedReason | ascii_downcase | gsub("_"; "-")) else null end),
+                  type: "issue"
+                }
+              ' 2>/dev/null)
+              if [ -n "$COMMENT_WITH_TYPE" ] && [ "$COMMENT_WITH_TYPE" != "null" ]; then
+                display_comment "$COMMENT_WITH_TYPE" "issue"
+              else
+                # Fallback to REST API if GraphQL fails
+                UPDATED_COMMENT=$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null)
+                if [ $? -eq 0 ] && [ -n "$UPDATED_COMMENT" ]; then
+                  COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '
+                    . + {
+                      type: "issue",
+                      isMinimized: (if .hidden == true then true else false end),
+                      minimizedReason: (if .hidden_reason then (.hidden_reason | ascii_downcase | gsub("_"; "-")) else null end)
+                    }
+                  ' 2>/dev/null)
+                  display_comment "$COMMENT_WITH_TYPE" "issue"
+                fi
+              fi
+            else
+              # Fallback to REST API if GraphQL fails
+              UPDATED_COMMENT=$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null)
+              if [ $? -eq 0 ] && [ -n "$UPDATED_COMMENT" ]; then
+                COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '
+                  . + {
+                    type: "issue",
+                    isMinimized: (if .hidden == true then true else false end),
+                    minimizedReason: (if .hidden_reason then (.hidden_reason | ascii_downcase | gsub("_"; "-")) else null end)
+                  }
+                ' 2>/dev/null)
+                display_comment "$COMMENT_WITH_TYPE" "issue"
+              fi
+            fi
+          else
+            # Fallback to REST API if we can't get PR number
+            UPDATED_COMMENT=$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null)
+            if [ $? -eq 0 ] && [ -n "$UPDATED_COMMENT" ]; then
+              COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '
+                . + {
+                  type: "issue",
+                  isMinimized: (if .hidden == true then true else false end),
+                  minimizedReason: (if .hidden_reason then (.hidden_reason | ascii_downcase | gsub("_"; "-")) else null end)
+                }
+              ' 2>/dev/null)
+              display_comment "$COMMENT_WITH_TYPE" "issue"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+fi
+
+# Resolve Flow (if --resolve is specified) - last step (after reply if both are specified)
+if [ -n "$ACTION_RESOLVE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
+  # Get thread ID from comment
+  # First, get the comment to find which thread it belongs to
+  OWNER=$(echo "$REPO" | cut -d'/' -f1)
+  REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+  
+  # Get PR number from comment
+  comment_data=$(gh api "repos/${REPO}/pulls/comments/${COMMENT_ID}" 2>/dev/null)
+  if [ $? -ne 0 ] || [ -z "$comment_data" ]; then
+    echo "Error: Could not fetch comment #${COMMENT_ID} or comment does not exist" >&2
+    ACTION_ERROR=1
+  else
+    PR_NUM=$(echo "$comment_data" | jq -r '.pull_request_url // ""' 2>/dev/null | sed -E 's|.*/pulls/([0-9]+).*|\1|' 2>/dev/null)
+    if [ -z "$PR_NUM" ]; then
+      echo "Error: Could not determine PR number from comment" >&2
+      ACTION_ERROR=1
+    else
+      # Find thread ID for this comment
+      THREAD_QUERY="{
+        repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+          pullRequest(number: $PR_NUM) {
+            reviewThreads(first: 100) {
+              nodes {
+                id
+                comments(first: 100) {
+                  nodes {
+                    databaseId
+                  }
+                }
+              }
+            }
+          }
+        }
+      }"
+      THREAD_DATA=$(gh api graphql -f query="$THREAD_QUERY" 2>/dev/null)
+      THREAD_ID=$(echo "$THREAD_DATA" | jq -r --arg id "$COMMENT_ID" '
+        .data.repository.pullRequest.reviewThreads.nodes[] |
+        select(.comments.nodes[].databaseId == ($id | tonumber)) |
+        .id
+      ' 2>/dev/null | head -1)
+      
+      if [ -z "$THREAD_ID" ] || [ "$THREAD_ID" = "null" ]; then
+        echo "Error: Could not find thread for comment #${COMMENT_ID}" >&2
+        ACTION_ERROR=1
+      else
+        if [ -z "$JSON_OUTPUT" ]; then
+          echo "Resolving review thread for comment #${COMMENT_ID}..."
+        fi
+        
+        if ! resolve_review_thread "$THREAD_ID"; then
+          ACTION_ERROR=1
+        elif [ -z "$JSON_OUTPUT" ]; then
+          echo "Successfully resolved thread for comment #${COMMENT_ID}"
+          echo ""
+          echo "Updated comment:"
+          # Fetch updated thread to show resolved status
+          THREAD_QUERY="{
+            repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
+              pullRequest(number: $PR_NUM) {
+                reviewThreads(first: 100) {
+                  nodes {
+                    id
+                    isResolved
+                    comments(first: 100) {
+                      nodes {
+                        id
+                        databaseId
+                        bodyText
+                        path
+                        line
+                        diffHunk
+                        createdAt
+                        updatedAt
+                        author {
+                          login
+                          ... on Bot {
+                            id
+                          }
+                        }
+                        url
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }"
+          THREAD_DATA=$(gh api graphql -f query="$THREAD_QUERY" 2>/dev/null)
+          # Find the thread and display first comment
+          THREAD_COMMENT=$(echo "$THREAD_DATA" | jq --arg thread_id "$THREAD_ID" --arg pr "$PR_NUM" --arg owner "$OWNER" --arg repo "$REPO_NAME" --arg comment_id "$COMMENT_ID" '
+            .data.repository.pullRequest.reviewThreads.nodes[] |
+            select(.id == $thread_id) |
+            .isResolved as $resolved |
+            .comments.nodes[] |
+            select(.databaseId == ($comment_id | tonumber)) |
+            {
+              id: .databaseId,
+              node_id: .id,
+              body: .bodyText,
+              path: .path,
+              line: .line,
+              diff_hunk: .diffHunk,
+              created_at: .createdAt,
+              updated_at: .updatedAt,
+              user: {
+                login: .author.login,
+                type: (if (.author | has("id")) then "Bot" else "User" end)
+              },
+              html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#discussion_r\(.databaseId)"),
+              url: .url,
+              isResolved: $resolved,
+              type: "review"
+            }
+          ' 2>/dev/null)
+          if [ -n "$THREAD_COMMENT" ] && [ "$THREAD_COMMENT" != "null" ]; then
+            display_comment "$THREAD_COMMENT" "review"
+          fi
+        fi
+      fi
+    fi
+  fi
+fi
+
+# Exit if there was an action error
+if [ "$ACTION_ERROR" -ne 0 ]; then
+  exit 1
+fi
+
+# If only actions were requested (no listing), exit here
+if [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; then
+  if [ -z "$PULL_REQUEST" ] && [ -z "$COMMENT_URL" ]; then
+    # Actions completed, no listing requested
+    # Display efficiency tip at the end if one was generated
+    if [ -n "$EFFICIENCY_TIP" ] && [ -z "$JSON_OUTPUT" ]; then
+      echo ""
+      echo "$EFFICIENCY_TIP"
+    fi
+    exit 0
+  fi
 fi
 
 # Calculate total, defaulting to 0 if jq fails or returns empty
@@ -501,28 +1715,62 @@ elif [ -n "$JSON_OUTPUT" ]; then
 else
   echo ""
   echo "=== Comments Summary ==="
+  # Build summary text with proper formatting (only show non-zero counts)
+  SUMMARY_PARTS=""
+  if [ "$REVIEW_TOTAL_BEFORE_FILTER" -gt 0 ]; then
+    SUMMARY_PARTS="$REVIEW_TOTAL_BEFORE_FILTER review"
+  fi
+  if [ "$ISSUE_TOTAL_BEFORE_FILTER" -gt 0 ]; then
+    if [ -n "$SUMMARY_PARTS" ]; then
+      SUMMARY_PARTS="$SUMMARY_PARTS, $ISSUE_TOTAL_BEFORE_FILTER issue"
+    else
+      SUMMARY_PARTS="$ISSUE_TOTAL_BEFORE_FILTER issue"
+    fi
+  fi
+  
   case "$USER_FILTER" in
     bots)
-      echo "Total bot comments: $TOTAL (from $REVIEW_TOTAL_BEFORE_FILTER review, $ISSUE_TOTAL_BEFORE_FILTER issue)"
+      echo "Total bot comments: $TOTAL (from $SUMMARY_PARTS)"
       ;;
     humans)
-      echo "Total human comments: $TOTAL (from $REVIEW_TOTAL_BEFORE_FILTER review, $ISSUE_TOTAL_BEFORE_FILTER issue)"
+      echo "Total human comments: $TOTAL (from $SUMMARY_PARTS)"
       ;;
     all)
-      echo "Total comments: $TOTAL (from $REVIEW_TOTAL_BEFORE_FILTER review, $ISSUE_TOTAL_BEFORE_FILTER issue)"
+      echo "Total comments: $TOTAL (from $SUMMARY_PARTS)"
       ;;
   esac
   TOTAL_BEFORE_FILTER=$((REVIEW_TOTAL_BEFORE_FILTER + ISSUE_TOTAL_BEFORE_FILTER))
   if [ "$TOTAL" -ne "$TOTAL_BEFORE_FILTER" ]; then
     FILTER_NOTES=""
-    if [ -z "$SHOW_RESOLVED" ]; then
-      FILTER_NOTES="unresolved status"
+    # Build filter notes
+    if [ -z "$SHOW_HIDDEN" ]; then
+      FILTER_PARTS=""
+      if [ "$REVIEW_TOTAL_BEFORE_FILTER" -gt 0 ]; then
+        FILTER_PARTS="unresolved review comments"
+      fi
+      if [ "$ISSUE_TOTAL_BEFORE_FILTER" -gt 0 ]; then
+        if [ -n "$FILTER_PARTS" ]; then
+          FILTER_PARTS="${FILTER_PARTS}, hidden issue comments"
+        else
+          FILTER_PARTS="hidden issue comments"
+        fi
+      fi
+      if [ -n "$FILTER_PARTS" ]; then
+        FILTER_NOTES="$FILTER_PARTS"
+      fi
     fi
     if [ -n "$PATH_FILTER" ]; then
       if [ -n "$FILTER_NOTES" ]; then
         FILTER_NOTES="${FILTER_NOTES}, path filter"
       else
         FILTER_NOTES="path filter"
+      fi
+    fi
+    if [ -n "$BODY_CONTAINS_STRING" ]; then
+      if [ -n "$FILTER_NOTES" ]; then
+        FILTER_NOTES="${FILTER_NOTES}, body text filter"
+      else
+        FILTER_NOTES="body text filter"
       fi
     fi
     if [ -n "$FILTER_NOTES" ]; then
@@ -549,13 +1797,24 @@ Created:           \(.created_at // "N/A")
 Updated:           \(.updated_at // "N/A")"
       '
       
-      # For review comments, show file and line info
+      # For review comments, show file and line info and resolved status
       if [ "$(echo "$COMMENT" | jq -r '.type')" = "review" ]; then
         echo "$COMMENT" | jq -r '
           "Path:              \(.path // "N/A")
 Line:              \(.line // "N/A")
-Diff Hunk:         \(.diff_hunk // "N/A" | split("\n") | .[0:3] | join(" | "))"
+Diff Hunk:         \(.diff_hunk // "N/A" | split("\n") | .[0:3] | join(" | "))
+Resolved:          \((if .isResolved == true then "Yes" elif .isResolved == false then "No" else "N/A" end))"
         '
+      fi
+      
+      # For issue comments, show hidden status and reason if hidden
+      if [ "$(echo "$COMMENT" | jq -r '.type')" = "issue" ]; then
+        IS_HIDDEN=$(echo "$COMMENT" | jq -r '.isMinimized // false' 2>/dev/null)
+        if [ "$IS_HIDDEN" = "true" ]; then
+          HIDE_REASON=$(echo "$COMMENT" | jq -r '.minimizedReason // "unknown"' 2>/dev/null)
+          echo "Hidden:             Yes"
+          echo "Hide Reason:        $HIDE_REASON"
+        fi
       fi
       
       # Show comment body (truncate if very long)
@@ -574,6 +1833,20 @@ Diff Hunk:         \(.diff_hunk // "N/A" | split("\n") | .[0:3] | join(" | "))"
         echo "URL:               $HTML_URL"
       fi
       
+      # For issue comments, show replies if any
+      if [ "$(echo "$COMMENT" | jq -r '.type')" = "issue" ]; then
+        REPLY_COUNT=$(echo "$COMMENT" | jq -r '(.replies // []) | length' 2>/dev/null || echo "0")
+        if [ "$REPLY_COUNT" -gt 0 ] && [ "$REPLY_COUNT" != "null" ]; then
+          echo ""
+          echo "                   Replies ($REPLY_COUNT):"
+          echo "$COMMENT" | jq -r '.replies[]? | 
+            "                   
+                   └─ Reply by \(.user.login // "N/A") on \(.created_at // "N/A")
+                      \(.body // "" | split("\n") | map("                      " + .) | join("\n"))"
+          ' 2>/dev/null
+        fi
+      fi
+      
       echo ""
     done
   else
@@ -581,5 +1854,11 @@ Diff Hunk:         \(.diff_hunk // "N/A" | split("\n") | .[0:3] | join(" | "))"
     if [ -n "$COMMENT_URL" ]; then
       echo "The comment URL may be invalid or you may not have access to it."
     fi
+  fi
+  
+  # Display efficiency tip at the end if one was generated
+  if [ -n "$EFFICIENCY_TIP" ] && [ -z "$JSON_OUTPUT" ]; then
+    echo ""
+    echo "$EFFICIENCY_TIP"
   fi
 fi
