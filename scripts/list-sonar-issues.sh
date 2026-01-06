@@ -50,6 +50,7 @@ COMPONENT=""
 JSON_OUTPUT=""
 COUNT_ONLY=""
 DETAILS=""
+DUPLICATIONS=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -94,6 +95,10 @@ while [[ $# -gt 0 ]]; do
       DETAILS="1"
       shift
       ;;
+    --show-code-duplications)
+      DUPLICATIONS="1"
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
@@ -109,6 +114,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --count                       Output only the count of items"
       echo "  --details                      Include detailed information (risk, fix guidance, etc.)"
       echo "                                Note: Details are always included when searching by key (-k)"
+      echo "  --show-code-duplications       Show code duplication information (file names, line numbers)"
       echo "  -h, --help                    Show this help message"
       echo ""
       echo "Examples:"
@@ -131,6 +137,8 @@ while [[ $# -gt 0 ]]; do
       echo "  $0 -pr 19 -s MAJOR --count            Output count of MAJOR issues for PR #19"
       echo "  $0 --details                          List all issues with detailed information"
       echo "  $0 -k AZsvly6yO42lZpvH9OC5            Show details for a specific issue (details auto-included)"
+      echo "  $0 --show-code-duplications          Show all code duplications in the project"
+      echo "  $0 -c src/index.ts --show-code-duplications  Show duplications for a specific file"
       exit 0
       ;;
     *)
@@ -156,6 +164,8 @@ ISSUES_API_URL="${SONAR_HOST}api/issues/search"
 HOTSPOTS_API_URL="${SONAR_HOST}api/hotspots/search"
 ISSUE_DETAIL_API_URL="${SONAR_HOST}api/issues/show"
 HOTSPOT_DETAIL_API_URL="${SONAR_HOST}api/hotspots/show"
+DUPLICATIONS_API_URL="${SONAR_HOST}api/duplications/show"
+MEASURES_COMPONENT_TREE_API_URL="${SONAR_HOST}api/measures/component_tree"
 
 # When searching by issue key, search within project and filter client-side
 # The 'issues' API parameter doesn't work reliably, so we filter client-side instead
@@ -556,8 +566,8 @@ if command -v jq &> /dev/null; then
   ISSUES_TOTAL=$(echo "$FILTERED_RESPONSE" | jq -r '.issuesTotal // 0')
   HOTSPOTS_TOTAL=$(echo "$FILTERED_RESPONSE" | jq -r '.hotspotsTotal // 0')
   
-  # Output count only if --count flag is set
-  if [ -n "$COUNT_ONLY" ]; then
+  # Output count only if --count flag is set (and not showing duplications)
+  if [ -n "$COUNT_ONLY" ] && [ -z "$DUPLICATIONS" ]; then
     if [ -n "$JSON_OUTPUT" ]; then
       echo "$FILTERED_RESPONSE" | jq '{total: .total, issuesTotal: .issuesTotal, hotspotsTotal: .hotspotsTotal}'
     else
@@ -569,7 +579,7 @@ if command -v jq &> /dev/null; then
         echo "Total Issues: $ISSUES_TOTAL"
       fi
     fi
-  elif [ -n "$JSON_OUTPUT" ]; then
+  elif [ -n "$JSON_OUTPUT" ] && [ -z "$DUPLICATIONS" ]; then
     echo "$FILTERED_RESPONSE" | jq '.'
   else
     # Fetch detailed information if requested (--details flag or when searching by key)
@@ -612,8 +622,39 @@ if command -v jq &> /dev/null; then
               fi
               
               # Merge the detail data into the item
+              # Preserve original component and project as strings (detail API may return objects)
               if [ -n "$DETAIL_DATA" ] && [ "$DETAIL_DATA" != "null" ] && [ "$DETAIL_DATA" != "{}" ]; then
-                ITEM=$(echo "$ITEM" | jq --argjson details "$DETAIL_DATA" '. + $details')
+                ORIGINAL_COMPONENT=$(echo "$ITEM" | jq -r '.component // ""')
+                ORIGINAL_PROJECT=$(echo "$ITEM" | jq -r '.project // ""')
+                
+                # Check if originals are strings (not objects)
+                ORIGINAL_COMPONENT_IS_STRING=$(echo "$ITEM" | jq -r 'if type(.component) == "string" then "true" else "false" end' 2>/dev/null || echo "true")
+                ORIGINAL_PROJECT_IS_STRING=$(echo "$ITEM" | jq -r 'if type(.project) == "string" then "true" else "false" end' 2>/dev/null || echo "true")
+                
+                # Merge detail data, but exclude component/project to preserve originals
+                DETAIL_DATA_NO_COMP_PROJ=$(echo "$DETAIL_DATA" | jq 'del(.component, .project)' 2>/dev/null || echo "$DETAIL_DATA")
+                ITEM=$(echo "$ITEM" | jq --argjson details "$DETAIL_DATA_NO_COMP_PROJ" '. + $details')
+                
+                # Restore original component/project if they were strings
+                if [ "$ORIGINAL_COMPONENT_IS_STRING" = "true" ] && [ -n "$ORIGINAL_COMPONENT" ] && [ "$ORIGINAL_COMPONENT" != "null" ]; then
+                  ITEM=$(echo "$ITEM" | jq --arg comp "$ORIGINAL_COMPONENT" '.component = $comp')
+                elif [ "$ORIGINAL_COMPONENT_IS_STRING" = "false" ]; then
+                  # Original was an object, try to extract key from detail API or keep original
+                  DETAIL_COMPONENT=$(echo "$DETAIL_DATA" | jq -r '.component.key // empty')
+                  if [ -n "$DETAIL_COMPONENT" ] && [ "$DETAIL_COMPONENT" != "null" ] && [ "$DETAIL_COMPONENT" != "" ]; then
+                    ITEM=$(echo "$ITEM" | jq --arg comp "$DETAIL_COMPONENT" '.component = $comp')
+                  fi
+                fi
+                
+                if [ "$ORIGINAL_PROJECT_IS_STRING" = "true" ] && [ -n "$ORIGINAL_PROJECT" ] && [ "$ORIGINAL_PROJECT" != "null" ]; then
+                  ITEM=$(echo "$ITEM" | jq --arg proj "$ORIGINAL_PROJECT" '.project = $proj')
+                elif [ "$ORIGINAL_PROJECT_IS_STRING" = "false" ]; then
+                  # Original was an object, try to extract key from detail API or keep original
+                  DETAIL_PROJECT=$(echo "$DETAIL_DATA" | jq -r '.project.key // empty')
+                  if [ -n "$DETAIL_PROJECT" ] && [ "$DETAIL_PROJECT" != "null" ] && [ "$DETAIL_PROJECT" != "" ]; then
+                    ITEM=$(echo "$ITEM" | jq --arg proj "$DETAIL_PROJECT" '.project = $proj')
+                  fi
+                fi
               fi
             fi
           fi
@@ -814,7 +855,8 @@ if command -v jq &> /dev/null; then
       
       # Display URL
       ITEM_KEY=$(echo "$ITEM" | jq -r '.key')
-      ITEM_PROJECT=$(echo "$ITEM" | jq -r '.project // "'${PROJECT_KEY}'"')
+      # Extract project key (handle both string and object formats)
+      ITEM_PROJECT=$(echo "$ITEM" | jq -r '.project.key // .project // "'${PROJECT_KEY}'"')
       if [ "$IS_HOTSPOT" = "true" ]; then
         URL="${SONAR_HOST}security_hotspots?id=${ITEM_PROJECT}&hotspots=${ITEM_KEY}"
       else
@@ -833,24 +875,160 @@ if command -v jq &> /dev/null; then
       fi
     fi
     
-    # Display summary at the end
-    echo ""
-    echo "=== Summary ==="
-    if [ -n "$ISSUE_KEY" ]; then
-      if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total items found: $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
-      elif [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total security hotspots found: $HOTSPOTS_TOTAL"
+    # Display duplications if requested
+    if [ -n "$DUPLICATIONS" ]; then
+      echo ""
+      echo "=== Code Duplications ==="
+      
+      # Determine which files to check for duplications
+      FILES_TO_CHECK="[]"
+      
+      if [ -n "$COMPONENT" ]; then
+        # If component filter is set, check that specific component
+        # Component might be a full key or just a path, try both
+        COMPONENT_KEY="${PROJECT_KEY}:${COMPONENT}"
+        # Check if component already includes project key
+        if [[ "$COMPONENT" == "${PROJECT_KEY}:"* ]]; then
+          COMPONENT_KEY="$COMPONENT"
+        fi
+        FILES_TO_CHECK=$(echo "[{\"key\": \"$COMPONENT_KEY\"}]" | jq '.')
       else
-        echo "Total issues found: $ISSUES_TOTAL"
+        # Find all files with duplications using component_tree
+        if [ -z "$JSON_OUTPUT" ]; then
+          echo "Finding files with code duplications..."
+        fi
+        COMPONENT_TREE_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${MEASURES_COMPONENT_TREE_API_URL}?component=${PROJECT_KEY}&metricKeys=duplicated_lines&qualifiers=FIL&ps=500")
+        if [ -n "$COMPONENT_TREE_RESPONSE" ] && echo "$COMPONENT_TREE_RESPONSE" | jq empty 2>/dev/null; then
+          # Extract files that have duplicated_lines > 0
+          FILES_TO_CHECK=$(echo "$COMPONENT_TREE_RESPONSE" | jq '[.components[]? | select(.measures[0].value != null and .measures[0].value != "0" and (.measures[0].value | tonumber) > 0) | {key: .key, duplicated_lines: .measures[0].value}]' 2>/dev/null)
+          if [ -z "$FILES_TO_CHECK" ] || [ "$FILES_TO_CHECK" = "null" ]; then
+            FILES_TO_CHECK="[]"
+          fi
+        fi
       fi
-    else
-      if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total items for project '${PROJECT_KEY}': $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
-      elif [ "$FETCH_HOTSPOTS" = "true" ]; then
-        echo "Total security hotspots for project '${PROJECT_KEY}': $HOTSPOTS_TOTAL"
+      
+      FILE_COUNT=$(echo "$FILES_TO_CHECK" | jq 'length // 0' 2>/dev/null || echo "0")
+      
+      if [ "$FILE_COUNT" -eq 0 ] || [ "$FILE_COUNT" = "null" ]; then
+        if [ -z "$JSON_OUTPUT" ]; then
+          if [ -n "$COMPONENT" ]; then
+            echo "No duplications found for component: $COMPONENT"
+          else
+            echo "No files with code duplications found in project."
+          fi
+        fi
       else
-        echo "Total issues for project '${PROJECT_KEY}': $ISSUES_TOTAL"
+        if [ -z "$JSON_OUTPUT" ]; then
+          echo "Found $FILE_COUNT file(s) with duplications"
+          echo ""
+        fi
+        
+        # Initialize JSON array if JSON output is requested
+        DUP_JSON_ARRAY="[]"
+        
+        # Process each file
+        for i in $(seq 0 $((FILE_COUNT - 1))); do
+          FILE_INFO=$(echo "$FILES_TO_CHECK" | jq ".[$i]" 2>/dev/null)
+          FILE_KEY=$(echo "$FILE_INFO" | jq -r '.key // ""')
+          DUPLICATED_LINES=$(echo "$FILE_INFO" | jq -r '.duplicated_lines // "0"')
+          
+          if [ -n "$FILE_KEY" ] && [ "$FILE_KEY" != "null" ] && [ "$FILE_KEY" != "" ]; then
+            # Fetch detailed duplication data for this file
+            DUP_RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" "${DUPLICATIONS_API_URL}?key=${FILE_KEY}")
+            
+            if [ -n "$DUP_RESPONSE" ] && echo "$DUP_RESPONSE" | jq empty 2>/dev/null; then
+              ERROR_MSG=$(echo "$DUP_RESPONSE" | jq -r '.errors[]?.msg // empty' 2>/dev/null)
+              if [ -z "$ERROR_MSG" ]; then
+                DUP_COUNT=$(echo "$DUP_RESPONSE" | jq '[.duplications[]?] | length' 2>/dev/null || echo "0")
+                
+                if [ "$DUP_COUNT" -gt 0 ] && [ "$DUP_COUNT" != "null" ]; then
+                  # Extract file name from key
+                  FILE_NAME=$(echo "$FILE_KEY" | sed "s|^${PROJECT_KEY}:||")
+                  
+                  if [ -z "$JSON_OUTPUT" ]; then
+                    echo "File: $FILE_NAME"
+                    if [ -n "$DUPLICATED_LINES" ] && [ "$DUPLICATED_LINES" != "0" ] && [ "$DUPLICATED_LINES" != "null" ]; then
+                      echo "Duplicated Lines: $DUPLICATED_LINES"
+                    fi
+                    echo "---"
+                    
+                    # Display each duplication group
+                    DUP_GROUPS=$(echo "$DUP_RESPONSE" | jq '.duplications // []' 2>/dev/null)
+                    GROUP_COUNT=$(echo "$DUP_GROUPS" | jq 'length' 2>/dev/null || echo "0")
+                    
+                    for j in $(seq 0 $((GROUP_COUNT - 1))); do
+                      GROUP=$(echo "$DUP_GROUPS" | jq ".[$j]" 2>/dev/null)
+                      BLOCKS=$(echo "$GROUP" | jq '.blocks // []' 2>/dev/null)
+                      BLOCK_COUNT=$(echo "$BLOCKS" | jq 'length' 2>/dev/null || echo "0")
+                      
+                      if [ "$BLOCK_COUNT" -gt 0 ]; then
+                        echo "Duplication Group $((j + 1)):"
+                        
+                        for k in $(seq 0 $((BLOCK_COUNT - 1))); do
+                          BLOCK=$(echo "$BLOCKS" | jq ".[$k]" 2>/dev/null)
+                          BLOCK_REF=$(echo "$BLOCK" | jq -r '._ref // ""')
+                          BLOCK_FROM=$(echo "$BLOCK" | jq -r '.from // "N/A"')
+                          BLOCK_SIZE=$(echo "$BLOCK" | jq -r '.size // "N/A"')
+                          
+                          # Get file info from files mapping
+                          FILE_REF=$(echo "$DUP_RESPONSE" | jq --arg ref "$BLOCK_REF" '.files[$ref] // {}' 2>/dev/null)
+                          REF_FILE_NAME=$(echo "$FILE_REF" | jq -r '.name // .key // "N/A"' 2>/dev/null)
+                          REF_FILE_KEY=$(echo "$FILE_REF" | jq -r '.key // ""' 2>/dev/null)
+                          
+                          # Calculate end line
+                          if [ "$BLOCK_FROM" != "N/A" ] && [ "$BLOCK_SIZE" != "N/A" ]; then
+                            BLOCK_TO=$((BLOCK_FROM + BLOCK_SIZE - 1))
+                            printf "  Block %d: Lines %d-%d (%d lines) in %s\n" "$((k + 1))" "$BLOCK_FROM" "$BLOCK_TO" "$BLOCK_SIZE" "$REF_FILE_NAME"
+                          else
+                            printf "  Block %d: Line %s, Size %s in %s\n" "$((k + 1))" "$BLOCK_FROM" "$BLOCK_SIZE" "$REF_FILE_NAME"
+                          fi
+                        done
+                        echo ""
+                      fi
+                    done
+                  else
+                    # JSON output - accumulate in array
+                    DUP_JSON_ARRAY=$(echo "$DUP_JSON_ARRAY" | jq --arg file "$FILE_KEY" --arg name "$FILE_NAME" --arg lines "$DUPLICATED_LINES" --argjson dup "$DUP_RESPONSE" '. + [{
+                      file: $file,
+                      fileName: $name,
+                      duplicatedLines: ($lines | tonumber),
+                      duplications: $dup.duplications,
+                      files: $dup.files
+                    }]')
+                  fi
+                fi
+              fi
+            fi
+          fi
+        done
+        
+        # Output accumulated JSON if requested
+        if [ -n "$JSON_OUTPUT" ] && [ -n "$DUP_JSON_ARRAY" ]; then
+          echo "$DUP_JSON_ARRAY" | jq '.'
+        fi
+      fi
+    fi
+    
+    # Display summary at the end (only if issues/hotspots were fetched)
+    if [ "$FETCH_ISSUES" = "true" ] || [ "$FETCH_HOTSPOTS" = "true" ]; then
+      echo ""
+      echo "=== Summary ==="
+      if [ -n "$ISSUE_KEY" ]; then
+        if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
+          echo "Total items found: $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
+        elif [ "$FETCH_HOTSPOTS" = "true" ]; then
+          echo "Total security hotspots found: $HOTSPOTS_TOTAL"
+        else
+          echo "Total issues found: $ISSUES_TOTAL"
+        fi
+      else
+        if [ "$FETCH_ISSUES" = "true" ] && [ "$FETCH_HOTSPOTS" = "true" ]; then
+          echo "Total items for project '${PROJECT_KEY}': $TOTAL (Issues: $ISSUES_TOTAL, Security Hotspots: $HOTSPOTS_TOTAL)"
+        elif [ "$FETCH_HOTSPOTS" = "true" ]; then
+          echo "Total security hotspots for project '${PROJECT_KEY}': $HOTSPOTS_TOTAL"
+        else
+          echo "Total issues for project '${PROJECT_KEY}': $ISSUES_TOTAL"
+        fi
       fi
     fi
   fi
