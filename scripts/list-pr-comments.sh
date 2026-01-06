@@ -33,6 +33,7 @@ REPLY_TEXT=""
 NO_PROMPT=""
 GET_HIDE_REASONS=""
 EFFICIENCY_TIP=""
+BULK_MODE=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -107,6 +108,10 @@ while [[ $# -gt 0 ]]; do
       NO_PROMPT="1"
       shift
       ;;
+    --bulk)
+      BULK_MODE="1"
+      shift
+      ;;
     --get-hide-reasons)
       GET_HIDE_REASONS="1"
       shift
@@ -132,11 +137,12 @@ while [[ $# -gt 0 ]]; do
       echo "  --count                       Output only the count of items"
       echo ""
       echo "Actions (can be combined - --reply and --resolve can be used together):"
-      echo "  --hide                        Hide an issue comment"
+      echo "  --hide                        Hide an issue comment (use with --bulk to hide all filtered)"
       echo "  --resolve                     Resolve a review comment thread"
       echo "  --reply [text]                Reply to a review comment"
       echo "                               If text is provided, use it; otherwise prompt interactively"
       echo "                               Can be combined with --resolve (reply first, then resolve)"
+      echo "  --bulk                        Apply action to all filtered comments (requires --hide)"
       echo ""
       echo "Action Options:"
       echo "  --reason <reason>             Reason for hiding (used with --hide)"
@@ -222,6 +228,11 @@ build_suggested_command() {
     else
       cmd="$cmd --reply"
     fi
+  fi
+  
+  # Add bulk flag
+  if [ -n "$BULK_MODE" ]; then
+    cmd="$cmd --bulk"
   fi
   
   # Add reason if provided
@@ -504,6 +515,9 @@ fi
 
 # Initialize ALL_COMMENTS to empty array
 ALL_COMMENTS="[]"
+# Initialize filter totals (used in summary)
+REVIEW_TOTAL_BEFORE_FILTER=0
+ISSUE_TOTAL_BEFORE_FILTER=0
 
 # If URL is provided, extract comment ID (and optionally fetch that specific comment)
 if [ -n "$COMMENT_URL" ]; then
@@ -751,7 +765,15 @@ fi
 
 if [ "$SHOULD_FETCH_PR" = "true" ]; then
   # Skip fetching comments if we're only performing actions (no listing needed)
-  if [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+  # Exception: Always fetch when bulk mode is enabled (needs comments to filter)
+  SHOULD_FETCH_COMMENTS=false
+  if [ -n "$BULK_MODE" ]; then
+    SHOULD_FETCH_COMMENTS=true
+  elif [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+    SHOULD_FETCH_COMMENTS=true
+  fi
+  
+  if [ "$SHOULD_FETCH_COMMENTS" = "true" ]; then
     if [ -z "$JSON_OUTPUT" ]; then
       echo "Fetching comments for PR #${PULL_REQUEST} in ${REPO}"
     fi
@@ -1265,12 +1287,15 @@ Updated:           \(.updated_at // .updatedAt // "N/A")"
   
   # For review comments, show file and line info and resolved status
   if [ "$comment_type" = "review" ]; then
+    RESOLVED_VALUE=$(echo "$comment_json" | jq -r 'if .isResolved == true then "Yes" elif .isResolved == false then "No" else "N/A" end' 2>/dev/null)
     echo "$comment_json" | jq -r '
       "Path:              \(.path // "N/A")
 Line:              \(.line // "N/A")
-Diff Hunk:         \(.diff_hunk // .diffHunk // "N/A" | split("\n") | .[0:3] | join(" | "))
-Resolved:          \((if .isResolved == true then "Yes" elif .isResolved == false then "No" else "N/A" end))"
+Diff Hunk:         \(.diff_hunk // .diffHunk // "N/A" | split("\n") | .[0:3] | join(" | "))"
     '
+    if [ "$RESOLVED_VALUE" != "N/A" ]; then
+      echo "Resolved:          $RESOLVED_VALUE"
+    fi
   fi
   
   # For issue comments, show hidden status and reason if hidden
@@ -1292,12 +1317,14 @@ Resolved:          \((if .isResolved == true then "Yes" elif .isResolved == fals
     echo "                   (truncated, full length: ${#BODY} characters)"
   else
     echo "Body:"
+    echo ""
     echo "$BODY" | sed 's/^/                   /'
   fi
   
   # Show URL
   HTML_URL=$(echo "$comment_json" | jq -r '.html_url // .url // ""')
   if [ -n "$HTML_URL" ] && [ "$HTML_URL" != "null" ]; then
+    echo ""
     echo "URL:               $HTML_URL"
   fi
   
@@ -1305,22 +1332,24 @@ Resolved:          \((if .isResolved == true then "Yes" elif .isResolved == fals
 }
 
 # Main Action Logic
-# Validate that comment ID is provided if an action is specified
-if { [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; } && [ -z "$COMMENT_ID" ]; then
-  echo "Error: -c/--comment-id or -u (URL) is required when using --hide, --resolve, or --reply" >&2
+# Validate that comment ID is provided if an action is specified (non-bulk mode)
+if { [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; } && [ -z "$COMMENT_ID" ] && [ -z "$BULK_MODE" ]; then
+  echo "Error: -c/--comment-id or -u (URL) is required when using --hide, --resolve, or --reply (or use --bulk with --hide)" >&2
   exit 1
 fi
 
-# Validate action combinations
-if [ -n "$ACTION_HIDE" ] && { [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; }; then
-  echo "Error: --hide cannot be combined with --resolve or --reply" >&2
-  exit 1
+# Validate action combinations (skip for bulk mode)
+if [ -z "$BULK_MODE" ]; then
+  if [ -n "$ACTION_HIDE" ] && { [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; }; then
+    echo "Error: --hide cannot be combined with --resolve or --reply" >&2
+    exit 1
+  fi
 fi
 
 ACTION_ERROR=0
 
-# Reply Flow (if --reply is specified) - do this first
-if [ -n "$ACTION_REPLY" ]; then
+# Reply Flow (if --reply is specified) - do this first (skip if bulk mode)
+if [ -n "$ACTION_REPLY" ] && [ -z "$BULK_MODE" ]; then
   if [ -z "$JSON_OUTPUT" ]; then
     echo "Replying to review comment #${COMMENT_ID}..."
   fi
@@ -1353,17 +1382,19 @@ if [ -n "$ACTION_REPLY" ]; then
         EFFICIENCY_TIP="Tip: For faster execution next time, use: $SUGGESTED_CMD"
         REPLY_TEXT=""
       fi
-      echo ""
-      echo "Updated comment:"
-      # Fetch updated comment with reply
+      # Only display the comment if we're not also resolving (resolve will display it)
+      if [ -z "$ACTION_RESOLVE" ]; then
+        echo ""
+        echo "Updated comment:"
+        # Fetch the entire thread to get all comments including the reply
       UPDATED_COMMENT=$(gh api "repos/${REPO}/pulls/comments/${COMMENT_ID}" 2>/dev/null)
       if [ $? -eq 0 ] && [ -n "$UPDATED_COMMENT" ]; then
-        COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
-        # Get PR number to fetch thread resolved status
+        # Get PR number to fetch thread with all comments
         PR_NUM=$(echo "$UPDATED_COMMENT" | jq -r '.pull_request_url // ""' 2>/dev/null | sed -E 's|.*/pulls/([0-9]+).*|\1|' 2>/dev/null)
         if [ -n "$PR_NUM" ]; then
           OWNER=$(echo "$REPO" | cut -d'/' -f1)
           REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
+          # Fetch entire thread with all comments
           THREAD_QUERY="{
             repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
               pullRequest(number: $PR_NUM) {
@@ -1373,6 +1404,20 @@ if [ -n "$ACTION_REPLY" ]; then
                     comments(first: 100) {
                       nodes {
                         databaseId
+                        id
+                        bodyText
+                        path
+                        line
+                        diffHunk
+                        createdAt
+                        updatedAt
+                        author {
+                          login
+                          ... on Bot {
+                            id
+                          }
+                        }
+                        url
                       }
                     }
                   }
@@ -1381,23 +1426,84 @@ if [ -n "$ACTION_REPLY" ]; then
             }
           }"
           THREAD_DATA=$(gh api graphql -f query="$THREAD_QUERY" 2>/dev/null)
-          RESOLVED_STATUS=$(echo "$THREAD_DATA" | jq -r --arg id "$COMMENT_ID" '
-            .data.repository.pullRequest.reviewThreads.nodes[] |
-            select(.comments.nodes[].databaseId == ($id | tonumber)) |
-            .isResolved
-          ' 2>/dev/null)
-          if [ -n "$RESOLVED_STATUS" ] && [ "$RESOLVED_STATUS" != "null" ]; then
-            COMMENT_WITH_TYPE=$(echo "$COMMENT_WITH_TYPE" | jq --argjson resolved "$RESOLVED_STATUS" '. + {isResolved: $resolved}' 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$THREAD_DATA" ]; then
+            # Find the thread containing this comment and display all comments in the thread
+            THREAD_COMMENTS=$(echo "$THREAD_DATA" | jq --arg id "$COMMENT_ID" --arg pr "$PR_NUM" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+              .data.repository.pullRequest.reviewThreads.nodes[] |
+              select(.comments.nodes[].databaseId == ($id | tonumber)) |
+              .isResolved as $resolved |
+              .comments.nodes[] |
+              {
+                id: .databaseId,
+                node_id: .id,
+                body: .bodyText,
+                path: .path,
+                line: .line,
+                diff_hunk: .diffHunk,
+                created_at: .createdAt,
+                updated_at: .updatedAt,
+                user: {
+                  login: .author.login,
+                  type: (if (.author | has("id")) then "Bot" else "User" end)
+                },
+                html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#discussion_r\(.databaseId)"),
+                url: .url,
+                isResolved: $resolved,
+                type: "review"
+              }
+            ' 2>/dev/null | jq -s '.' 2>/dev/null)
+            
+            if [ -n "$THREAD_COMMENTS" ] && [ "$THREAD_COMMENTS" != "null" ] && [ "$THREAD_COMMENTS" != "[]" ]; then
+              # Display all comments in the thread
+              COMMENT_COUNT=$(echo "$THREAD_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
+              for i in $(seq 0 $((COMMENT_COUNT - 1))); do
+                COMMENT_JSON=$(echo "$THREAD_COMMENTS" | jq ".[$i]" 2>/dev/null)
+                if [ "$i" -eq 0 ]; then
+                  # First comment is the original
+                  display_comment "$COMMENT_JSON" "review"
+                else
+                  # Subsequent comments are replies
+                  REPLY_ID=$(echo "$COMMENT_JSON" | jq -r '.id // .databaseId // "N/A"')
+                  REPLY_AUTHOR=$(echo "$COMMENT_JSON" | jq -r '.user.login // .author.login // "N/A"')
+                  REPLY_CREATED=$(echo "$COMMENT_JSON" | jq -r '.created_at // .createdAt // "N/A"')
+                  REPLY_BODY=$(echo "$COMMENT_JSON" | jq -r '.body // .bodyText // ""')
+                  
+                  echo ""
+                  echo "  └─ Reply by $REPLY_AUTHOR on $REPLY_CREATED"
+                  echo "     $REPLY_BODY" | sed 's/^/     /'
+                fi
+              done
+            else
+              # Fallback to single comment display if thread fetch fails
+              COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
+              RESOLVED_STATUS=$(echo "$THREAD_DATA" | jq -r --arg id "$COMMENT_ID" '
+                .data.repository.pullRequest.reviewThreads.nodes[] |
+                select(.comments.nodes[].databaseId == ($id | tonumber)) |
+                .isResolved
+              ' 2>/dev/null)
+              if [ -n "$RESOLVED_STATUS" ] && [ "$RESOLVED_STATUS" != "null" ]; then
+                COMMENT_WITH_TYPE=$(echo "$COMMENT_WITH_TYPE" | jq --argjson resolved "$RESOLVED_STATUS" '. + {isResolved: $resolved}' 2>/dev/null)
+              fi
+              display_comment "$COMMENT_WITH_TYPE" "review"
+            fi
+          else
+            # Fallback to REST API if GraphQL fails
+            COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
+            display_comment "$COMMENT_WITH_TYPE" "review"
           fi
+        else
+          # Fallback if PR number can't be determined
+          COMMENT_WITH_TYPE=$(echo "$UPDATED_COMMENT" | jq '. + {type: "review"}' 2>/dev/null)
+          display_comment "$COMMENT_WITH_TYPE" "review"
         fi
-        display_comment "$COMMENT_WITH_TYPE" "review"
+      fi
       fi
     fi
   fi
 fi
 
-# Hide Flow (if --hide is specified) - last step
-if [ -n "$ACTION_HIDE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
+# Hide Flow (if --hide is specified) - last step (skip if bulk mode)
+if [ -n "$ACTION_HIDE" ] && [ "$ACTION_ERROR" -eq 0 ] && [ -z "$BULK_MODE" ]; then
   # Validate comment type is issue
   comment_data=$(gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" 2>/dev/null)
   if [ $? -ne 0 ] || [ -z "$comment_data" ]; then
@@ -1555,8 +1661,8 @@ if [ -n "$ACTION_HIDE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
   fi
 fi
 
-# Resolve Flow (if --resolve is specified) - last step (after reply if both are specified)
-if [ -n "$ACTION_RESOLVE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
+# Resolve Flow (if --resolve is specified) - last step (after reply if both are specified) (skip if bulk mode)
+if [ -n "$ACTION_RESOLVE" ] && [ "$ACTION_ERROR" -eq 0 ] && [ -z "$BULK_MODE" ]; then
   # Get thread ID from comment
   # First, get the comment to find which thread it belongs to
   OWNER=$(echo "$REPO" | cut -d'/' -f1)
@@ -1602,6 +1708,7 @@ if [ -n "$ACTION_RESOLVE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
         ACTION_ERROR=1
       else
         if [ -z "$JSON_OUTPUT" ]; then
+          echo ""
           echo "Resolving review thread for comment #${COMMENT_ID}..."
         fi
         
@@ -1611,7 +1718,7 @@ if [ -n "$ACTION_RESOLVE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
           echo "Successfully resolved thread for comment #${COMMENT_ID}"
           echo ""
           echo "Updated comment:"
-          # Fetch updated thread to show resolved status
+          # Fetch updated thread to show resolved status and all replies
           THREAD_QUERY="{
             repository(owner: \"$OWNER\", name: \"$REPO_NAME\") {
               pullRequest(number: $PR_NUM) {
@@ -1644,34 +1751,84 @@ if [ -n "$ACTION_RESOLVE" ] && [ "$ACTION_ERROR" -eq 0 ]; then
             }
           }"
           THREAD_DATA=$(gh api graphql -f query="$THREAD_QUERY" 2>/dev/null)
-          # Find the thread and display first comment
-          THREAD_COMMENT=$(echo "$THREAD_DATA" | jq --arg thread_id "$THREAD_ID" --arg pr "$PR_NUM" --arg owner "$OWNER" --arg repo "$REPO_NAME" --arg comment_id "$COMMENT_ID" '
-            .data.repository.pullRequest.reviewThreads.nodes[] |
-            select(.id == $thread_id) |
-            .isResolved as $resolved |
-            .comments.nodes[] |
-            select(.databaseId == ($comment_id | tonumber)) |
-            {
-              id: .databaseId,
-              node_id: .id,
-              body: .bodyText,
-              path: .path,
-              line: .line,
-              diff_hunk: .diffHunk,
-              created_at: .createdAt,
-              updated_at: .updatedAt,
-              user: {
-                login: .author.login,
-                type: (if (.author | has("id")) then "Bot" else "User" end)
-              },
-              html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#discussion_r\(.databaseId)"),
-              url: .url,
-              isResolved: $resolved,
-              type: "review"
-            }
-          ' 2>/dev/null)
-          if [ -n "$THREAD_COMMENT" ] && [ "$THREAD_COMMENT" != "null" ]; then
-            display_comment "$THREAD_COMMENT" "review"
+          if [ $? -eq 0 ] && [ -n "$THREAD_DATA" ]; then
+            # Find the thread and display all comments including replies
+            THREAD_COMMENTS=$(echo "$THREAD_DATA" | jq --arg thread_id "$THREAD_ID" --arg pr "$PR_NUM" --arg owner "$OWNER" --arg repo "$REPO_NAME" '
+              .data.repository.pullRequest.reviewThreads.nodes[] |
+              select(.id == $thread_id) |
+              .isResolved as $resolved |
+              .comments.nodes[] |
+              {
+                id: .databaseId,
+                node_id: .id,
+                body: .bodyText,
+                path: .path,
+                line: .line,
+                diff_hunk: .diffHunk,
+                created_at: .createdAt,
+                updated_at: .updatedAt,
+                user: {
+                  login: .author.login,
+                  type: (if (.author | has("id")) then "Bot" else "User" end)
+                },
+                html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#discussion_r\(.databaseId)"),
+                url: .url,
+                isResolved: $resolved,
+                type: "review"
+              }
+            ' 2>/dev/null | jq -s '.' 2>/dev/null)
+            
+            if [ -n "$THREAD_COMMENTS" ] && [ "$THREAD_COMMENTS" != "null" ] && [ "$THREAD_COMMENTS" != "[]" ]; then
+              # Display all comments in the thread
+              COMMENT_COUNT=$(echo "$THREAD_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
+              for i in $(seq 0 $((COMMENT_COUNT - 1))); do
+                COMMENT_JSON=$(echo "$THREAD_COMMENTS" | jq ".[$i]" 2>/dev/null)
+                if [ "$i" -eq 0 ]; then
+                  # First comment is the original
+                  display_comment "$COMMENT_JSON" "review"
+                else
+                  # Subsequent comments are replies
+                  REPLY_ID=$(echo "$COMMENT_JSON" | jq -r '.id // .databaseId // "N/A"')
+                  REPLY_AUTHOR=$(echo "$COMMENT_JSON" | jq -r '.user.login // .author.login // "N/A"')
+                  REPLY_CREATED=$(echo "$COMMENT_JSON" | jq -r '.created_at // .createdAt // "N/A"')
+                  REPLY_BODY=$(echo "$COMMENT_JSON" | jq -r '.body // .bodyText // ""')
+                  
+                  echo ""
+                  echo "  └─ Reply by $REPLY_AUTHOR on $REPLY_CREATED"
+                  echo "     $REPLY_BODY" | sed 's/^/     /'
+                fi
+              done
+            else
+              # Fallback to single comment display if thread fetch fails
+              THREAD_COMMENT=$(echo "$THREAD_DATA" | jq --arg thread_id "$THREAD_ID" --arg pr "$PR_NUM" --arg owner "$OWNER" --arg repo "$REPO_NAME" --arg comment_id "$COMMENT_ID" '
+                .data.repository.pullRequest.reviewThreads.nodes[] |
+                select(.id == $thread_id) |
+                .isResolved as $resolved |
+                .comments.nodes[] |
+                select(.databaseId == ($comment_id | tonumber)) |
+                {
+                  id: .databaseId,
+                  node_id: .id,
+                  body: .bodyText,
+                  path: .path,
+                  line: .line,
+                  diff_hunk: .diffHunk,
+                  created_at: .createdAt,
+                  updated_at: .updatedAt,
+                  user: {
+                    login: .author.login,
+                    type: (if (.author | has("id")) then "Bot" else "User" end)
+                  },
+                  html_url: ("https://github.com/\($owner)/\($repo)/pull/\($pr)#discussion_r\(.databaseId)"),
+                  url: .url,
+                  isResolved: $resolved,
+                  type: "review"
+                }
+              ' 2>/dev/null)
+              if [ -n "$THREAD_COMMENT" ] && [ "$THREAD_COMMENT" != "null" ]; then
+                display_comment "$THREAD_COMMENT" "review"
+              fi
+            fi
           fi
         fi
       fi
@@ -1697,6 +1854,137 @@ if [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; 
   fi
 fi
 
+# Handle bulk mode (after comments are fetched and filtered)
+if [ -n "$BULK_MODE" ]; then
+  if [ -z "$ACTION_HIDE" ]; then
+    echo "Error: --bulk requires --hide action" >&2
+    exit 1
+  fi
+  
+  if [ -z "$PULL_REQUEST" ]; then
+    echo "Error: --bulk requires -pr to specify the pull request" >&2
+    exit 1
+  fi
+  
+  # Get reason for hiding (prompt if not provided)
+  final_reason=""
+  if [ -n "$HIDE_REASON" ]; then
+    if validate_hide_reason "$HIDE_REASON"; then
+      final_reason="$HIDE_REASON"
+    else
+      echo "Error: Invalid hide reason '${HIDE_REASON}'" >&2
+      exit 1
+    fi
+  elif [ -z "$NO_PROMPT" ]; then
+    final_reason=$(prompt_for_reason)
+    if [ $? -ne 0 ]; then
+      echo "Error: Failed to get hide reason" >&2
+      exit 1
+    fi
+  else
+    echo "Error: --bulk --hide specified but --reason not provided and --no-prompt is set" >&2
+    exit 1
+  fi
+  
+  # Convert reason to GraphQL enum format
+  graphql_reason=$(convert_reason_to_graphql "$final_reason")
+  if [ $? -ne 0 ] || [ -z "$graphql_reason" ]; then
+    echo "Error: Could not convert reason to GraphQL format" >&2
+    exit 1
+  fi
+  
+  # Get all filtered issue comments (bulk hide only works on issue comments)
+  if [ -z "$JSON_OUTPUT" ]; then
+    echo "Bulk hiding issue comments matching filters..."
+    if [ -n "$BODY_CONTAINS_STRING" ]; then
+      echo "  Filter: body contains \"$BODY_CONTAINS_STRING\""
+    fi
+    if [ -n "$USER_FILTER" ] && [ "$USER_FILTER" != "all" ]; then
+      echo "  Filter: $USER_FILTER comments only"
+    fi
+    echo "  Reason: $final_reason"
+    echo ""
+  fi
+  
+  # Extract issue comments from ALL_COMMENTS
+  # Note: ALL_COMMENTS already has filters applied (hidden status, body text, etc.)
+  TOTAL_BEFORE_FILTER=$(echo "$ALL_COMMENTS" | jq 'length' 2>/dev/null || echo "0")
+  ISSUE_COMMENTS_TO_HIDE=$(echo "$ALL_COMMENTS" | jq '[.[] | select(.type == "issue")]' 2>/dev/null)
+  ISSUE_COUNT=$(echo "$ISSUE_COMMENTS_TO_HIDE" | jq 'length' 2>/dev/null || echo "0")
+  
+  if [ "$ISSUE_COUNT" -eq 0 ] || [ "$ISSUE_COUNT" = "null" ]; then
+    if [ -z "$JSON_OUTPUT" ]; then
+      echo "No issue comments found matching the filters."
+      if [ "$TOTAL_BEFORE_FILTER" -eq 0 ]; then
+        echo ""
+        echo "Note: No comments were fetched. Make sure -pr is specified correctly."
+      else
+        echo ""
+        echo "Note: Found $TOTAL_BEFORE_FILTER total comment(s) but none are issue comments matching the filters."
+        echo "      You can list comments first without --bulk to see what matches."
+      fi
+    fi
+    exit 0
+  fi
+  
+  if [ -z "$JSON_OUTPUT" ]; then
+    echo "Found $ISSUE_COUNT issue comment(s) to hide"
+    echo ""
+  fi
+  
+  # Process each comment
+  SUCCESS_COUNT=0
+  FAIL_COUNT=0
+  i=0
+  while [ "$i" -lt "$ISSUE_COUNT" ]; do
+    COMMENT_JSON=$(echo "$ISSUE_COMMENTS_TO_HIDE" | jq ".[$i]" 2>/dev/null)
+    COMMENT_ID_TO_HIDE=$(echo "$COMMENT_JSON" | jq -r '.id // .databaseId // ""' 2>/dev/null)
+    
+    if [ -n "$COMMENT_ID_TO_HIDE" ] && [ "$COMMENT_ID_TO_HIDE" != "null" ]; then
+      if [ -z "$JSON_OUTPUT" ]; then
+        echo "[$((i + 1))/$ISSUE_COUNT] Hiding comment #${COMMENT_ID_TO_HIDE}..."
+      fi
+      
+      if hide_issue_comment "$COMMENT_ID_TO_HIDE" "$graphql_reason"; then
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        if [ -z "$JSON_OUTPUT" ]; then
+          echo "  ✓ Success"
+        fi
+      else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        if [ -z "$JSON_OUTPUT" ]; then
+          echo "  ✗ Failed"
+        fi
+      fi
+    else
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    
+    i=$((i + 1))
+  done
+  
+  # Summary
+  if [ -z "$JSON_OUTPUT" ]; then
+    echo ""
+    echo "=== Bulk Hide Summary ==="
+    echo "Total processed: $ISSUE_COUNT"
+    echo "Successful:      $SUCCESS_COUNT"
+    echo "Failed:          $FAIL_COUNT"
+    echo ""
+    
+    if [ "$SUCCESS_COUNT" -gt 0 ]; then
+      SUGGESTED_CMD=$(build_suggested_command "$final_reason")
+      EFFICIENCY_TIP="Tip: For faster execution next time, use: $SUGGESTED_CMD"
+      echo "$EFFICIENCY_TIP"
+    fi
+  else
+    echo "{\"total\": $ISSUE_COUNT, \"successful\": $SUCCESS_COUNT, \"failed\": $FAIL_COUNT}"
+  fi
+  
+  # Exit after bulk operation
+  exit 0
+fi
+
 # Calculate total, defaulting to 0 if jq fails or returns empty
 TOTAL=$(echo "$ALL_COMMENTS" | jq -r 'length // 0' 2>/dev/null)
 if [ -z "$TOTAL" ] || [ "$TOTAL" = "null" ]; then
@@ -1713,10 +2001,97 @@ if [ -n "$COUNT_ONLY" ]; then
 elif [ -n "$JSON_OUTPUT" ]; then
   echo "$ALL_COMMENTS" | jq '.'
 else
+  if [ "$TOTAL" -gt 0 ]; then
+    for i in $(seq 0 $((TOTAL - 1))); do
+      COMMENT=$(echo "$ALL_COMMENTS" | jq ".[$i]")
+      COMMENT_ID=$(echo "$COMMENT" | jq -r '.id // "N/A"')
+      
+      echo ""
+      echo "Comment ID: $COMMENT_ID"
+      echo "---"
+      
+      # Display comment details
+      echo "$COMMENT" | jq -r '
+        "Type:              \((.type // "N/A") | ascii_upcase)
+Author:            \(.user.login // "N/A")
+Author Type:       \(.user.type // "N/A")
+Created:           \(.created_at // "N/A")
+Updated:           \(.updated_at // "N/A")"
+      '
+      
+      # For review comments, show file and line info and resolved status
+      if [ "$(echo "$COMMENT" | jq -r '.type')" = "review" ]; then
+        RESOLVED_VALUE=$(echo "$COMMENT" | jq -r 'if .isResolved == true then "Yes" elif .isResolved == false then "No" else "N/A" end' 2>/dev/null)
+        echo "$COMMENT" | jq -r '
+          "Path:              \(.path // "N/A")
+Line:              \(.line // "N/A")
+Diff Hunk:         \(.diff_hunk // "N/A" | split("\n") | .[0:3] | join(" | "))"
+        '
+        if [ "$RESOLVED_VALUE" != "N/A" ]; then
+          echo "Resolved:          $RESOLVED_VALUE"
+        fi
+      fi
+      
+      # For issue comments, show hidden status and reason if hidden
+      if [ "$(echo "$COMMENT" | jq -r '.type')" = "issue" ]; then
+        IS_HIDDEN=$(echo "$COMMENT" | jq -r '.isMinimized // false' 2>/dev/null)
+        if [ "$IS_HIDDEN" = "true" ]; then
+          HIDE_REASON=$(echo "$COMMENT" | jq -r '.minimizedReason // "unknown"' 2>/dev/null)
+          echo "Hidden:             Yes"
+          echo "Hide Reason:        $HIDE_REASON"
+        fi
+      fi
+      
+      # Show comment body (truncate if very long)
+      BODY=$(echo "$COMMENT" | jq -r '.body // ""')
+      if [ ${#BODY} -gt 500 ]; then
+        echo "Body:              ${BODY:0:500}..."
+        echo "                   (truncated, full length: ${#BODY} characters)"
+      else
+        echo "Body:"
+        echo ""
+        echo "$BODY" | sed 's/^/                   /'
+      fi
+      
+      # Show URL
+      HTML_URL=$(echo "$COMMENT" | jq -r '.html_url // ""')
+      if [ -n "$HTML_URL" ] && [ "$HTML_URL" != "null" ]; then
+        echo ""
+        echo "URL:               $HTML_URL"
+      fi
+      
+      # For issue comments, show replies if any
+      if [ "$(echo "$COMMENT" | jq -r '.type')" = "issue" ]; then
+        REPLY_COUNT=$(echo "$COMMENT" | jq -r '(.replies // []) | length' 2>/dev/null || echo "0")
+        if [ "$REPLY_COUNT" -gt 0 ] && [ "$REPLY_COUNT" != "null" ]; then
+          echo ""
+          echo "                   Replies ($REPLY_COUNT):"
+          echo "$COMMENT" | jq -r '.replies[]? | 
+            "                   
+                   └─ Reply by \(.user.login // "N/A") on \(.created_at // "N/A")
+                      \(.body // "" | split("\n") | map("                      " + .) | join("\n"))"
+          ' 2>/dev/null
+        fi
+      fi
+      
+      echo ""
+    done
+  else
+    echo "No comments found."
+    if [ -n "$COMMENT_URL" ]; then
+      echo "The comment URL may be invalid or you may not have access to it."
+    fi
+  fi
+  
+  # Display summary at the end
   echo ""
   echo "=== Comments Summary ==="
   # Build summary text with proper formatting (only show non-zero counts)
   SUMMARY_PARTS=""
+  # Ensure variables are set (default to 0 if not set)
+  REVIEW_TOTAL_BEFORE_FILTER=${REVIEW_TOTAL_BEFORE_FILTER:-0}
+  ISSUE_TOTAL_BEFORE_FILTER=${ISSUE_TOTAL_BEFORE_FILTER:-0}
+  
   if [ "$REVIEW_TOTAL_BEFORE_FILTER" -gt 0 ]; then
     SUMMARY_PARTS="$REVIEW_TOTAL_BEFORE_FILTER review"
   fi
@@ -1730,13 +2105,25 @@ else
   
   case "$USER_FILTER" in
     bots)
-      echo "Total bot comments: $TOTAL (from $SUMMARY_PARTS)"
+      if [ -n "$SUMMARY_PARTS" ]; then
+        echo "Total bot comments: $TOTAL (from $SUMMARY_PARTS)"
+      else
+        echo "Total bot comments: $TOTAL"
+      fi
       ;;
     humans)
-      echo "Total human comments: $TOTAL (from $SUMMARY_PARTS)"
+      if [ -n "$SUMMARY_PARTS" ]; then
+        echo "Total human comments: $TOTAL (from $SUMMARY_PARTS)"
+      else
+        echo "Total human comments: $TOTAL"
+      fi
       ;;
     all)
-      echo "Total comments: $TOTAL (from $SUMMARY_PARTS)"
+      if [ -n "$SUMMARY_PARTS" ]; then
+        echo "Total comments: $TOTAL (from $SUMMARY_PARTS)"
+      else
+        echo "Total comments: $TOTAL"
+      fi
       ;;
   esac
   TOTAL_BEFORE_FILTER=$((REVIEW_TOTAL_BEFORE_FILTER + ISSUE_TOTAL_BEFORE_FILTER))
@@ -1775,84 +2162,6 @@ else
     fi
     if [ -n "$FILTER_NOTES" ]; then
       echo "Note: Filtered by $FILTER_NOTES"
-    fi
-  fi
-  echo ""
-
-  if [ "$TOTAL" -gt 0 ]; then
-    for i in $(seq 0 $((TOTAL - 1))); do
-      COMMENT=$(echo "$ALL_COMMENTS" | jq ".[$i]")
-      COMMENT_ID=$(echo "$COMMENT" | jq -r '.id // "N/A"')
-      
-      echo ""
-      echo "Comment ID: $COMMENT_ID"
-      echo "---"
-      
-      # Display comment details
-      echo "$COMMENT" | jq -r '
-        "Type:              \((.type // "N/A") | ascii_upcase)
-Author:            \(.user.login // "N/A")
-Author Type:       \(.user.type // "N/A")
-Created:           \(.created_at // "N/A")
-Updated:           \(.updated_at // "N/A")"
-      '
-      
-      # For review comments, show file and line info and resolved status
-      if [ "$(echo "$COMMENT" | jq -r '.type')" = "review" ]; then
-        echo "$COMMENT" | jq -r '
-          "Path:              \(.path // "N/A")
-Line:              \(.line // "N/A")
-Diff Hunk:         \(.diff_hunk // "N/A" | split("\n") | .[0:3] | join(" | "))
-Resolved:          \((if .isResolved == true then "Yes" elif .isResolved == false then "No" else "N/A" end))"
-        '
-      fi
-      
-      # For issue comments, show hidden status and reason if hidden
-      if [ "$(echo "$COMMENT" | jq -r '.type')" = "issue" ]; then
-        IS_HIDDEN=$(echo "$COMMENT" | jq -r '.isMinimized // false' 2>/dev/null)
-        if [ "$IS_HIDDEN" = "true" ]; then
-          HIDE_REASON=$(echo "$COMMENT" | jq -r '.minimizedReason // "unknown"' 2>/dev/null)
-          echo "Hidden:             Yes"
-          echo "Hide Reason:        $HIDE_REASON"
-        fi
-      fi
-      
-      # Show comment body (truncate if very long)
-      BODY=$(echo "$COMMENT" | jq -r '.body // ""')
-      if [ ${#BODY} -gt 500 ]; then
-        echo "Body:              ${BODY:0:500}..."
-        echo "                   (truncated, full length: ${#BODY} characters)"
-      else
-        echo "Body:"
-        echo "$BODY" | sed 's/^/                   /'
-      fi
-      
-      # Show URL
-      HTML_URL=$(echo "$COMMENT" | jq -r '.html_url // ""')
-      if [ -n "$HTML_URL" ] && [ "$HTML_URL" != "null" ]; then
-        echo "URL:               $HTML_URL"
-      fi
-      
-      # For issue comments, show replies if any
-      if [ "$(echo "$COMMENT" | jq -r '.type')" = "issue" ]; then
-        REPLY_COUNT=$(echo "$COMMENT" | jq -r '(.replies // []) | length' 2>/dev/null || echo "0")
-        if [ "$REPLY_COUNT" -gt 0 ] && [ "$REPLY_COUNT" != "null" ]; then
-          echo ""
-          echo "                   Replies ($REPLY_COUNT):"
-          echo "$COMMENT" | jq -r '.replies[]? | 
-            "                   
-                   └─ Reply by \(.user.login // "N/A") on \(.created_at // "N/A")
-                      \(.body // "" | split("\n") | map("                      " + .) | join("\n"))"
-          ' 2>/dev/null
-        fi
-      fi
-      
-      echo ""
-    done
-  else
-    echo "No comments found."
-    if [ -n "$COMMENT_URL" ]; then
-      echo "The comment URL may be invalid or you may not have access to it."
     fi
   fi
   

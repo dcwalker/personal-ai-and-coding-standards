@@ -57,6 +57,14 @@ export default [
           argsIgnorePattern: '^_',
         },
       ],
+      '@typescript-eslint/only-throw-error': [
+        'error',
+        {
+          allowThrowingAny: false,
+          allowThrowingUnknown: false,
+          allow: ['InvocationError'],
+        },
+      ],
       'multiline-comment-style': ['error', 'starred-block'],
       'jsdoc/require-description': 'error',
     },
@@ -88,6 +96,18 @@ export default [
   },
   {
     files: ['**/*.spec.ts', '**/*.test.ts', '**/*.test.tsx', '**/*.spec.tsx'],
+    languageOptions: {
+      ecmaVersion: 2020,
+      sourceType: 'module',
+      globals: {
+        ...globals.node,
+        ...globals.jest,
+      },
+      parser: tsParser,
+      parserOptions: {
+        project: './tsconfig.eslint.json',
+      },
+    },
     rules: {
       // Overrides '@typescript-eslint/explicit-function-return-type': 'error'
       '@typescript-eslint/explicit-function-return-type': 'off',
@@ -105,4 +125,3 @@ export default [
   },
   prettierConfig,
 ];
-
