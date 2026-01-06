@@ -1310,16 +1310,11 @@ Diff Hunk:         \(.diff_hunk // .diffHunk // "N/A" | split("\n") | .[0:3] | j
     fi
   fi
   
-  # Show comment body (truncate if very long)
+  # Show comment body
   BODY=$(echo "$comment_json" | jq -r '.body // .bodyText // ""')
-  if [ ${#BODY} -gt 500 ]; then
-    echo "Body:              ${BODY:0:500}..."
-    echo "                   (truncated, full length: ${#BODY} characters)"
-  else
-    echo "Body:"
-    echo ""
-    echo "$BODY" | sed 's/^/                   /'
-  fi
+  echo "Body:"
+  echo ""
+  echo "$BODY" | sed 's/^/                   /'
   
   # Show URL
   HTML_URL=$(echo "$comment_json" | jq -r '.html_url // .url // ""')
@@ -1842,8 +1837,39 @@ if [ "$ACTION_ERROR" -ne 0 ]; then
 fi
 
 # If only actions were requested (no listing), exit here
+# Skip listing if actions were performed and no explicit listing was requested
+# (i.e., if we have actions but no filters that would indicate listing intent)
 if [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; then
-  if [ -z "$PULL_REQUEST" ] && [ -z "$COMMENT_URL" ]; then
+  # If we have actions and no listing-related filters (except those used with actions), exit
+  # Listing intent is indicated by: --type (without action), --bots/--humans (without action), 
+  # --path (without action), --body-contains-string (without --bulk), --show-hidden (without action),
+  # --count, or --json
+  HAS_LISTING_INTENT=false
+  if [ -n "$COUNT_ONLY" ] || [ -n "$JSON_OUTPUT" ]; then
+    HAS_LISTING_INTENT=true
+  elif [ -n "$COMMENT_TYPE" ] && [ "$COMMENT_TYPE" != "all" ] && [ -z "$ACTION_HIDE" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+    HAS_LISTING_INTENT=true
+  elif [ -n "$USER_FILTER" ] && [ "$USER_FILTER" != "all" ] && [ -z "$BULK_MODE" ]; then
+    HAS_LISTING_INTENT=true
+  elif [ -n "$PATH_FILTER" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+    HAS_LISTING_INTENT=true
+  elif [ -n "$BODY_CONTAINS_STRING" ] && [ -z "$BULK_MODE" ]; then
+    HAS_LISTING_INTENT=true
+  elif [ -n "$SHOW_HIDDEN" ] && [ -z "$ACTION_HIDE" ]; then
+    HAS_LISTING_INTENT=true
+  fi
+  
+  # If no listing intent and we have a PR/URL but also have a comment ID (which means we're targeting a specific comment)
+  # then we should exit after actions since we've already displayed the updated comment
+  if [ "$HAS_LISTING_INTENT" = "false" ] && [ -n "$COMMENT_ID" ]; then
+    # Actions completed, no listing requested
+    # Display efficiency tip at the end if one was generated
+    if [ -n "$EFFICIENCY_TIP" ] && [ -z "$JSON_OUTPUT" ]; then
+      echo ""
+      echo "$EFFICIENCY_TIP"
+    fi
+    exit 0
+  elif [ "$HAS_LISTING_INTENT" = "false" ] && [ -z "$PULL_REQUEST" ] && [ -z "$COMMENT_URL" ]; then
     # Actions completed, no listing requested
     # Display efficiency tip at the end if one was generated
     if [ -n "$EFFICIENCY_TIP" ] && [ -z "$JSON_OUTPUT" ]; then
@@ -1985,6 +2011,33 @@ if [ -n "$BULK_MODE" ]; then
   exit 0
 fi
 
+# If we only performed actions on a specific comment (via -c), skip listing
+# This check is here as a safety net in case the earlier exit didn't catch it
+if { [ -n "$ACTION_HIDE" ] || [ -n "$ACTION_RESOLVE" ] || [ -n "$ACTION_REPLY" ]; } && [ -n "$COMMENT_ID" ] && [ -z "$COUNT_ONLY" ] && [ -z "$JSON_OUTPUT" ]; then
+  # Check if we have any listing intent (filters that suggest listing, not just action support)
+  HAS_ANY_LISTING_INTENT=false
+  if [ -n "$COMMENT_TYPE" ] && [ "$COMMENT_TYPE" != "all" ]; then
+    HAS_ANY_LISTING_INTENT=true
+  elif [ -n "$USER_FILTER" ] && [ "$USER_FILTER" != "all" ] && [ -z "$BULK_MODE" ]; then
+    HAS_ANY_LISTING_INTENT=true
+  elif [ -n "$PATH_FILTER" ] && [ -z "$ACTION_RESOLVE" ] && [ -z "$ACTION_REPLY" ]; then
+    HAS_ANY_LISTING_INTENT=true
+  elif [ -n "$BODY_CONTAINS_STRING" ] && [ -z "$BULK_MODE" ]; then
+    HAS_ANY_LISTING_INTENT=true
+  elif [ -n "$SHOW_HIDDEN" ] && [ -z "$ACTION_HIDE" ]; then
+    HAS_ANY_LISTING_INTENT=true
+  fi
+  
+  # If no listing intent, exit here (actions already completed and displayed)
+  if [ "$HAS_ANY_LISTING_INTENT" = "false" ]; then
+    if [ -n "$EFFICIENCY_TIP" ] && [ -z "$JSON_OUTPUT" ]; then
+      echo ""
+      echo "$EFFICIENCY_TIP"
+    fi
+    exit 0
+  fi
+fi
+
 # Calculate total, defaulting to 0 if jq fails or returns empty
 TOTAL=$(echo "$ALL_COMMENTS" | jq -r 'length // 0' 2>/dev/null)
 if [ -z "$TOTAL" ] || [ "$TOTAL" = "null" ]; then
@@ -2042,16 +2095,11 @@ Diff Hunk:         \(.diff_hunk // "N/A" | split("\n") | .[0:3] | join(" | "))"
         fi
       fi
       
-      # Show comment body (truncate if very long)
+      # Show comment body
       BODY=$(echo "$COMMENT" | jq -r '.body // ""')
-      if [ ${#BODY} -gt 500 ]; then
-        echo "Body:              ${BODY:0:500}..."
-        echo "                   (truncated, full length: ${#BODY} characters)"
-      else
-        echo "Body:"
-        echo ""
-        echo "$BODY" | sed 's/^/                   /'
-      fi
+      echo "Body:"
+      echo ""
+      echo "$BODY" | sed 's/^/                   /'
       
       # Show URL
       HTML_URL=$(echo "$COMMENT" | jq -r '.html_url // ""')
