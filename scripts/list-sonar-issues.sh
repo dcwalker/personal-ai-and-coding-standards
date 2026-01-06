@@ -8,18 +8,36 @@ SONAR_HOST="${SONAR_HOST_URL}"
 SONAR_HOST="${SONAR_HOST%/}/"  # Ensure trailing slash
 SONAR_TOKEN="${SONAR_TOKEN}"
 
+# Find project root by searching up the directory tree for sonar-project.properties
+find_project_root() {
+  local dir="$1"
+  while [ "$dir" != "/" ]; do
+    if [ -f "$dir/sonar-project.properties" ]; then
+      echo "$dir"
+      return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
 # Try to get project key from environment variable, or read from sonar-project.properties
 if [ -n "$SONAR_PROJECT_KEY" ]; then
   PROJECT_KEY="$SONAR_PROJECT_KEY"
-elif [ -f "sonar-project.properties" ]; then
-  PROJECT_KEY=$(grep "^sonar.projectKey=" sonar-project.properties 2>/dev/null | cut -d'=' -f2- | tr -d ' ')
+else
+  # Find project root by searching up from current directory
+  PROJECT_ROOT=$(find_project_root "$(pwd)")
+  if [ -z "$PROJECT_ROOT" ]; then
+    echo "Error: SONAR_PROJECT_KEY environment variable is not set and sonar-project.properties file not found"
+    exit 1
+  fi
+  
+  PROPERTIES_FILE="$PROJECT_ROOT/sonar-project.properties"
+  PROJECT_KEY=$(grep "^sonar.projectKey=" "$PROPERTIES_FILE" 2>/dev/null | cut -d'=' -f2- | tr -d ' ')
   if [ -z "$PROJECT_KEY" ]; then
     echo "Error: Could not find sonar.projectKey in sonar-project.properties"
     exit 1
   fi
-else
-  echo "Error: SONAR_PROJECT_KEY environment variable is not set and sonar-project.properties file not found"
-  exit 1
 fi
 
 PULL_REQUEST=""
