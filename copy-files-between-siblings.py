@@ -20,6 +20,7 @@ FILES_TO_COPY = [
     'eslint-local-rules/no-consecutive-logging.mjs',
     'scripts/list-sonar-issues.sh',
     'scripts/list-pr-comments.sh',
+    'scripts/list-pr-checks.sh',
 ]
 
 
