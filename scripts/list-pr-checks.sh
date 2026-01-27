@@ -1171,6 +1171,34 @@ else
       echo "0 checks"
     fi
     echo ""
+    
+    # Get last commit SHA and summary from origin (via GitHub API)
+    PR_DATA=$(gh api "repos/${REPO}/pulls/${PULL_REQUEST}" 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$PR_DATA" ]; then
+      HEAD_SHA=$(echo "$PR_DATA" | jq -r '.head.sha // empty' 2>/dev/null)
+      if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" != "null" ] && [ "$HEAD_SHA" != "" ]; then
+        # Get short SHA (first 7 characters)
+        SHORT_SHA=$(echo "$HEAD_SHA" | cut -c1-7)
+        
+        # Get commit message summary (first line) from GitHub API
+        COMMIT_DATA=$(gh api "repos/${REPO}/commits/${HEAD_SHA}" 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$COMMIT_DATA" ]; then
+          COMMIT_SUMMARY=$(echo "$COMMIT_DATA" | jq -r '.commit.message // ""' 2>/dev/null | head -n1 | sed 's/\r$//')
+          
+          echo "Last commit:"
+          if [ -n "$COMMIT_SUMMARY" ] && [ "$COMMIT_SUMMARY" != "" ] && [ "$COMMIT_SUMMARY" != "null" ]; then
+            echo "  ${SHORT_SHA} - ${COMMIT_SUMMARY}"
+          else
+            echo "  ${SHORT_SHA}"
+          fi
+        else
+          echo "Last commit:"
+          echo "  ${SHORT_SHA}"
+        fi
+      fi
+    fi
+    echo ""
+    
     echo "PR: https://github.com/${REPO}/pull/${PULL_REQUEST}"
       else
         echo "No checks found matching the specified filters."
