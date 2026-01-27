@@ -165,6 +165,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Auto-detect PR from current branch if not provided
+if [ -z "$PULL_REQUEST" ] && [ -z "$COMMENT_URL" ] && [ -z "$COMMENT_ID" ]; then
+  CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ -n "$CURRENT_BRANCH" ]; then
+    DETECTED_PR=$(gh pr view --json number -q .number 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$DETECTED_PR" ] && [ "$DETECTED_PR" != "null" ]; then
+      PULL_REQUEST="$DETECTED_PR"
+      if [ -z "$JSON_OUTPUT" ]; then
+        echo "Auto-detected PR #${PULL_REQUEST} from current branch: ${CURRENT_BRANCH}"
+      fi
+    fi
+  fi
+fi
+
 # Validation functions
 # Cache for valid hide reasons (fetched from API)
 VALID_HIDE_REASONS=""

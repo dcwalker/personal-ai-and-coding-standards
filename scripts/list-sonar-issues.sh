@@ -51,6 +51,7 @@ JSON_OUTPUT=""
 COUNT_ONLY=""
 DETAILS=""
 DUPLICATIONS=""
+FETCH_ALL_PROJECT_ISSUES=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -99,11 +100,16 @@ while [[ $# -gt 0 ]]; do
       DUPLICATIONS="1"
       shift
       ;;
+    --all)
+      FETCH_ALL_PROJECT_ISSUES="1"
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
       echo "  -pr, --pull-request <number>  Filter issues for a specific pull request"
+      echo "  --all                          Fetch all project issues (not PR-specific)"
       echo "  -s, --severity <level>        Filter by severity: BLOCKER, CRITICAL, MAJOR, MINOR, INFO"
       echo "  -t, --type <type>             Filter by type: CODE_SMELL, BUG, VULNERABILITY, SECURITY_HOTSPOT"
       echo "  --status <status>             Filter by status: OPEN, CONFIRMED, REOPENED, RESOLVED, CLOSED"
@@ -116,29 +122,6 @@ while [[ $# -gt 0 ]]; do
       echo "                                Note: Details are always included when searching by key (-k)"
       echo "  --show-code-duplications       Show code duplication information (file names, line numbers)"
       echo "  -h, --help                    Show this help message"
-      echo ""
-      echo "Examples:"
-      echo "  $0                                    List all open issues for the project"
-      echo "  $0 -pr 19                             List issues for pull request #19"
-      echo "  $0 -s CRITICAL                        List all CRITICAL severity issues"
-      echo "  $0 -pr 19 -s MAJOR                    List MAJOR issues for PR #19"
-      echo "  $0 -t BUG -s BLOCKER                  List BLOCKER severity BUGs"
-      echo "  $0 -t SECURITY_HOTSPOT                 List all security hotspots"
-      echo "  $0 -r typescript:S6606                List issues for a specific rule"
-      echo "  $0 -k AZsvly6yO42lZpvH9OC5            Show details for a specific issue"
-      echo "                                       Note: Issue key search may not find issues"
-      echo "                                       that only exist in PR context. Use -pr with"
-      echo "                                       the key for better results."
-      echo "  $0 -c src/utils/logger.ts             List issues for a specific component"
-      echo "  $0 -pr 19 -s MAJOR -t CODE_SMELL      Combine multiple filters"
-      echo "  $0 --json                              Output only JSON format"
-      echo "  $0 -pr 19 --json                      Output JSON for PR #19 issues"
-      echo "  $0 --count                            Output only the count"
-      echo "  $0 -pr 19 -s MAJOR --count            Output count of MAJOR issues for PR #19"
-      echo "  $0 --details                          List all issues with detailed information"
-      echo "  $0 -k AZsvly6yO42lZpvH9OC5            Show details for a specific issue (details auto-included)"
-      echo "  $0 --show-code-duplications          Show all code duplications in the project"
-      echo "  $0 -c src/index.ts --show-code-duplications  Show duplications for a specific file"
       exit 0
       ;;
     *)
@@ -148,6 +131,20 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Auto-detect PR from current branch if not provided and --all is not set
+if [ -z "$PULL_REQUEST" ] && [ -z "$FETCH_ALL_PROJECT_ISSUES" ]; then
+  CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ -n "$CURRENT_BRANCH" ]; then
+    DETECTED_PR=$(gh pr view --json number -q .number 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$DETECTED_PR" ] && [ "$DETECTED_PR" != "null" ]; then
+      PULL_REQUEST="$DETECTED_PR"
+      if [ -z "$JSON_OUTPUT" ]; then
+        echo "Auto-detected PR #${PULL_REQUEST} from current branch: ${CURRENT_BRANCH}"
+      fi
+    fi
+  fi
+fi
 
 if [ -z "$SONAR_HOST_URL" ]; then
   echo "Error: SONAR_HOST_URL environment variable is not set"
