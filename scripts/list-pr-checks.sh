@@ -677,6 +677,7 @@ fi
 # For CircleCI checks, enrich with CircleCI API data
 # Get CircleCI pipelines to match jobs
 CIRCLE_JOBS_MAP="{}"
+PIPELINE_ERRORS_MAP="{}"
 if echo "$GITHUB_CHECKS" | jq '[.[] | select(.is_circleci == true)] | length' 2>/dev/null | grep -q '[1-9]'; then
   # We have CircleCI checks, validate CIRCLE_TOKEN is set
   if [ -z "$CIRCLE_TOKEN" ]; then
@@ -703,6 +704,14 @@ if echo "$GITHUB_CHECKS" | jq '[.[] | select(.is_circleci == true)] | length' 2>
       PIPELINE_NUMBER=$(echo "$PIPELINES" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .number // "N/A"' 2>/dev/null)
       PIPELINE_CREATED=$(echo "$PIPELINES" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .created_at // "N/A"' 2>/dev/null)
       PIPELINE_VCS_BRANCH=$(echo "$PIPELINES" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .vcs.branch // "N/A"' 2>/dev/null)
+      
+      # Extract pipeline errors if any
+      PIPELINE_ERRORS=$(echo "$PIPELINES" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .errors // []' 2>/dev/null)
+      if [ -n "$PIPELINE_ERRORS" ] && [ "$PIPELINE_ERRORS" != "null" ] && [ "$PIPELINE_ERRORS" != "[]" ]; then
+        if [ "$PIPELINE_NUMBER" != "N/A" ] && [ "$PIPELINE_NUMBER" != "null" ]; then
+          PIPELINE_ERRORS_MAP=$(echo "$PIPELINE_ERRORS_MAP" | jq --arg pipeline_number "$PIPELINE_NUMBER" --argjson errors "$PIPELINE_ERRORS" '.[$pipeline_number] = $errors' 2>/dev/null || echo "$PIPELINE_ERRORS_MAP")
+        fi
+      fi
       
       WORKFLOWS=$(get_workflows_for_pipeline "$pipeline_id")
       WORKFLOW_IDS=$(echo "$WORKFLOWS" | jq -r '.[].id' 2>/dev/null)
@@ -733,19 +742,24 @@ if echo "$GITHUB_CHECKS" | jq '[.[] | select(.is_circleci == true)] | length' 2>
 fi
 
 # Enrich GitHub checks with CircleCI data where applicable
-ALL_CHECKS=$(echo "$GITHUB_CHECKS" | jq --argjson circle_jobs "$CIRCLE_JOBS_MAP" '
+ALL_CHECKS=$(echo "$GITHUB_CHECKS" | jq --argjson circle_jobs "$CIRCLE_JOBS_MAP" --argjson pipeline_errors "$PIPELINE_ERRORS_MAP" '
   map(
     . as $check |
     if $check.is_circleci == true then
       # Extract job name from context (e.g., "ci/circleci: job_name" -> "job_name")
       ($check.context | split(": ") | if length > 1 then .[1] else $check.context end) as $job_name |
       ($circle_jobs[$job_name] // {}) as $circle_job |
+      ($circle_job.pipeline_number // null) as $pipeline_num |
+      # If no pipeline number from job, try to get first pipeline number from errors map
+      (if $pipeline_num == null then ($pipeline_errors | keys | if length > 0 then .[0] else null end) else ($pipeline_num | tostring) end) as $pipeline_key |
+      ($pipeline_errors[$pipeline_key] // null) as $errors |
       $check + {
         job_number: $circle_job.job_number,
         workflow_name: $circle_job.workflow_name,
-        pipeline_number: $circle_job.pipeline_number,
+        pipeline_number: ($circle_job.pipeline_number // (if $pipeline_key != null then ($pipeline_key | tonumber) else null end)),
         pipeline_created_at: $circle_job.pipeline_created_at,
         pipeline_branch: $circle_job.pipeline_branch,
+        pipeline_errors: $errors,
         started_at: ($circle_job.started_at // $check.started_at),
         stopped_at: ($circle_job.stopped_at // $check.completed_at)
       }
@@ -936,6 +950,7 @@ else
       PIPELINE_NUMBER=$(echo "$CHECK" | jq -r '.pipeline_number // "N/A"')
       PIPELINE_CREATED=$(echo "$CHECK" | jq -r '.pipeline_created_at // "N/A"')
       PIPELINE_BRANCH=$(echo "$CHECK" | jq -r '.pipeline_branch // "N/A"')
+      PIPELINE_ERRORS=$(echo "$CHECK" | jq '.pipeline_errors // null' 2>/dev/null)
       
       # Determine emoji based on status
       STATUS_LOWER=$(echo "$CHECK_STATUS" | tr '[:upper:]' '[:lower:]')
@@ -981,6 +996,15 @@ else
         fi
         if [ "$PIPELINE_CREATED" != "N/A" ] && [ "$PIPELINE_CREATED" != "null" ]; then
           echo "Pipeline Created: $PIPELINE_CREATED"
+        fi
+        # Display pipeline errors if any
+        if [ "$PIPELINE_ERRORS" != "null" ] && [ "$PIPELINE_ERRORS" != "" ] && [ -n "$PIPELINE_ERRORS" ]; then
+          ERROR_COUNT=$(echo "$PIPELINE_ERRORS" | jq 'length' 2>/dev/null || echo "0")
+          if [ "$ERROR_COUNT" -gt 0 ] 2>/dev/null; then
+            echo ""
+            echo "Pipeline Errors:"
+            echo "$PIPELINE_ERRORS" | jq -r '.[] | "  - \(.type // "error"): \(.message // "Unknown error")"' 2>/dev/null
+          fi
         fi
         if [ "$JOB_NUMBER" != "N/A" ] && [ "$JOB_NUMBER" != "null" ]; then
           echo "Job Number:       $JOB_NUMBER"
