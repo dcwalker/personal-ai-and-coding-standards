@@ -19,12 +19,25 @@ fi
 OWNER=$(echo "$REPO" | cut -d'/' -f1)
 REPO_NAME=$(echo "$REPO" | cut -d'/' -f2)
 
-# CircleCI project slug format: vcs-type/org/repo (e.g., gh/owner/repo)
-# Default to GitHub (gh) if not specified
-if [ -n "$CIRCLE_PROJECT_SLUG" ]; then
-  PROJECT_SLUG="$CIRCLE_PROJECT_SLUG"
+# CircleCI project slug format: vcs-type/org/repo (e.g., github/owner/repo)
+# Read from catalog-info.yaml (required)
+if [ ! -f "catalog-info.yaml" ]; then
+  echo "Error: catalog-info.yaml is required but not found." >&2
+  echo "       Expected format in catalog-info.yaml:" >&2
+  echo "         annotations:" >&2
+  echo "           circleci.com/project-slug: github/owner/repo" >&2
+  exit 1
+fi
+
+CATALOG_SLUG=$(grep -E "^[[:space:]]*circleci\.com/project-slug:" catalog-info.yaml 2>/dev/null | sed 's/.*circleci\.com\/project-slug:[[:space:]]*//' | tr -d '"' | tr -d "'")
+if [ -n "$CATALOG_SLUG" ]; then
+  PROJECT_SLUG="$CATALOG_SLUG"
 else
-  PROJECT_SLUG="gh/${OWNER}/${REPO_NAME}"
+  echo "Error: catalog-info.yaml exists but does not contain circleci.com/project-slug annotation." >&2
+  echo "       Expected format in catalog-info.yaml:" >&2
+  echo "         annotations:" >&2
+  echo "           circleci.com/project-slug: github/owner/repo" >&2
+  exit 1
 fi
 
 # Extract vcs-type, org, and repo from project slug
@@ -124,9 +137,24 @@ done
 # Note: CIRCLE_TOKEN is only required if there are CircleCI checks to enrich
 # We'll validate it later when we actually need it
 
+# Auto-detect PR number from current branch if not provided
+if [ -z "$PULL_REQUEST" ]; then
+  # Try to get PR number from current branch using gh CLI
+  if command -v gh &> /dev/null && gh auth status &> /dev/null; then
+    DETECTED_PR=$(gh pr view --json number 2>/dev/null | jq -r '.number // empty' 2>/dev/null)
+    if [ -n "$DETECTED_PR" ] && [ "$DETECTED_PR" != "null" ] && [ "$DETECTED_PR" != "" ]; then
+      PULL_REQUEST="$DETECTED_PR"
+      if [ -z "$JSON_OUTPUT" ]; then
+        echo "Auto-detected PR #${PULL_REQUEST} from current branch" >&2
+      fi
+    fi
+  fi
+fi
+
 # Validate PR number is provided
 if [ -z "$PULL_REQUEST" ]; then
   echo "Error: Pull request number is required. Use -pr or --pull-request to specify the PR number."
+  echo "       Or run this script from a branch that has an associated pull request."
   echo "Use -h or --help for usage information"
   exit 1
 fi
@@ -226,11 +254,13 @@ get_github_status_checks() {
   fi
   
   # Get check runs for the commit (REST API - more reliable)
+  # Use --paginate to get all pages of check runs
   local check_runs
-  check_runs=$(gh api "repos/${REPO}/commits/${head_sha}/check-runs?per_page=100" 2>/dev/null)
+  check_runs=$(gh api --paginate "repos/${REPO}/commits/${head_sha}/check-runs?per_page=100" 2>/dev/null)
   local check_runs_exit=$?
   
   # Get status contexts for the commit (REST API)
+  # Note: Status endpoint is not paginated, returns all statuses in one response
   local statuses
   statuses=$(gh api "repos/${REPO}/commits/${head_sha}/status" 2>/dev/null)
   local statuses_exit=$?
@@ -238,10 +268,13 @@ get_github_status_checks() {
   local all_checks="[]"
   
   # Process check runs
+  # When using --paginate, gh api returns multiple JSON objects (one per page)
+  # Each object has a .check_runs array, so we need to collect all of them
   if [ $check_runs_exit -eq 0 ] && [ -n "$check_runs" ]; then
     local runs
-    runs=$(echo "$check_runs" | jq -r '
-      .check_runs[]? | {
+    # Collect all check_runs arrays from all pages and flatten into a single array
+    runs=$(echo "$check_runs" | jq -s '[.[] | .check_runs[]?] | 
+      map({
         name: .name,
         status: (if .status == "completed" then (.conclusion | ascii_downcase) else (.status | ascii_downcase) end),
         conclusion: (.conclusion // "" | ascii_downcase),
@@ -252,8 +285,8 @@ get_github_status_checks() {
         context: .name,
         is_circleci: ((.app.slug // .app.name // "") | test("circleci"; "i")),
         type: "check_run"
-      }
-    ' 2>/dev/null | jq -s '.' 2>/dev/null)
+      })
+    ' 2>/dev/null)
     
     if [ -n "$runs" ] && [ "$runs" != "null" ] && [ "$runs" != "[]" ]; then
       all_checks=$(echo "$all_checks" | jq --argjson runs "$runs" '. + $runs' 2>/dev/null || echo "$all_checks")
@@ -261,14 +294,16 @@ get_github_status_checks() {
   fi
   
   # Process status contexts
+  # Status endpoint returns a single object with a .statuses array
   if [ $statuses_exit -eq 0 ] && [ -n "$statuses" ]; then
     local contexts
+    # Extract statuses array and map to our format
     contexts=$(echo "$statuses" | jq -r '
       .statuses[]? | {
         name: .context,
         status: (.state | ascii_downcase),
         conclusion: (.state | ascii_downcase),
-        description: .description // "",
+        description: (.description // ""),
         html_url: .target_url,
         started_at: null,
         completed_at: null,
@@ -291,6 +326,7 @@ get_github_status_checks() {
       (sort_by(.type == "status") | .[0])
     )
   ' 2>/dev/null || echo "$all_checks")
+  
   
   if [ -z "$all_checks" ] || [ "$all_checks" = "null" ]; then
     echo "[]"
@@ -450,39 +486,99 @@ get_jobs_for_workflow() {
   echo "$all_jobs"
 }
 
-# Function to get job details
+# Function to get job details (v2 API)
 get_job_details() {
   local job_number="$1"
   local url="${CIRCLE_API_BASE}/project/${PROJECT_SLUG}/job/${job_number}"
   circleci_api_request "$url"
 }
 
-# Function to get test metadata for a job
+# Function to get test metadata for a job (v2 API)
 get_job_tests() {
   local job_number="$1"
   local url="${CIRCLE_API_BASE}/project/${PROJECT_SLUG}/${job_number}/tests"
   circleci_api_request "$url"
 }
 
-# Function to get job output/logs (using v1.1 API for step output)
-get_job_output() {
+# Function to get job details with steps/actions from v1.1 API
+# Note: v1.1 API is needed here to get steps/actions with output_url (v2 doesn't provide this)
+# v1.1 API uses "github" not "gh" as the vcs-type
+get_job_with_steps_v1() {
   local job_number="$1"
-  # CircleCI v1.1 API endpoint for job output
-  local url="https://circleci.com/api/v1.1/project/${PROJECT_SLUG}/${job_number}/output"
-  local response
-  response=$(curl -s -H "Circle-Token: ${CIRCLE_TOKEN}" "$url" 2>/dev/null)
-  local exit_code=$?
   
-  if [ $exit_code -ne 0 ]; then
+  # Convert project slug from v2 format (gh/org/repo or github/org/repo) to v1.1 format (github/org/repo)
+  local v1_project_slug
+  if echo "$PROJECT_SLUG" | grep -q "^gh/"; then
+    v1_project_slug=$(echo "$PROJECT_SLUG" | sed 's|^gh/|github/|')
+  else
+    v1_project_slug="$PROJECT_SLUG"
+  fi
+  
+  local url="https://circleci.com/api/v1.1/project/${v1_project_slug}/${job_number}"
+  local response
+  local http_code
+  
+  # Get response and HTTP status code
+  response=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Circle-Token: ${CIRCLE_TOKEN}" "$url" 2>/dev/null)
+  http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2)
+  response=$(echo "$response" | sed '/HTTP_CODE:/d')
+  
+  # Check if request failed or returned error status
+  if [ -z "$http_code" ] || [ "$http_code" != "200" ]; then
     return 1
   fi
   
-  # Check for API errors
+  # Check for API errors in JSON response
   if echo "$response" | jq -e '.message // .error // empty' >/dev/null 2>&1; then
     return 1
   fi
   
   echo "$response"
+}
+
+# Function to download and extract log content from S3 URL
+download_log_from_url() {
+  local output_url="$1"
+  if [ -z "$output_url" ] || [ "$output_url" = "null" ] || [ "$output_url" = "" ]; then
+    return 1
+  fi
+  
+  # Download the log file from S3 (requires Circle-Token for authentication)
+  curl -s -H "Circle-Token: ${CIRCLE_TOKEN}" "$output_url" 2>/dev/null
+}
+
+# Function to format log content from JSON array format
+# The log content is a JSON array with objects containing "message", "time", "type", "truncated"
+format_log_output() {
+  local log_content="$1"
+  if [ -z "$log_content" ]; then
+    return 1
+  fi
+  
+  # Check if it's a JSON array
+  if ! echo "$log_content" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    # Not JSON, return as-is
+    echo "$log_content"
+    return 0
+  fi
+  
+  # Extract messages from JSON array, preserving order
+  # jq -r will decode Unicode escape sequences (\u001b, \r, etc.) and output raw text
+  # Then strip ANSI escape codes and control characters for cleaner output
+  echo "$log_content" | jq -r '.[]? | select(.message != null and .message != "") | .message' 2>/dev/null | \
+    while IFS= read -r line || [ -n "$line" ]; do
+      # Remove carriage returns
+      line=$(echo "$line" | tr -d '\r')
+      # Remove ANSI escape codes (color codes, cursor movement, etc.)
+      # This regex handles: \x1b[ followed by numbers/semicolons and ending with a letter
+      line=$(echo "$line" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
+      # Remove other common ANSI codes
+      line=$(echo "$line" | sed 's/\x1b\[K//g' | sed 's/\x1b\[2K//g' | sed 's/\x1b\[1G//g' | sed 's/\x1b\[0K//g')
+      # Only print non-empty lines
+      if [ -n "$line" ]; then
+        echo "$line"
+      fi
+    done
 }
 
 # Function to query recent pipelines as fallback (when branch-based query fails)
@@ -659,6 +755,55 @@ ALL_CHECKS=$(echo "$GITHUB_CHECKS" | jq --argjson circle_jobs "$CIRCLE_JOBS_MAP"
   )
 ' 2>/dev/null || echo "$GITHUB_CHECKS")
 
+# Find expected CircleCI jobs (jobs in workflow but no check run yet)
+if [ -n "$CIRCLE_JOBS_MAP" ] && [ "$CIRCLE_JOBS_MAP" != "{}" ] && [ "$CIRCLE_JOBS_MAP" != "null" ]; then
+  # Get list of job names from CircleCI workflow
+  WORKFLOW_JOB_NAMES=$(echo "$CIRCLE_JOBS_MAP" | jq -r 'keys[]' 2>/dev/null)
+  
+  # Get list of existing CircleCI check names from GitHub
+  EXISTING_CHECK_NAMES=$(echo "$ALL_CHECKS" | jq -r '.[] | select(.is_circleci == true) | (.context | split(": ") | if length > 1 then .[1] else .context end)' 2>/dev/null)
+  
+  # Find missing jobs (in workflow but not in GitHub checks)
+  for job_name in $WORKFLOW_JOB_NAMES; do
+    if [ -z "$job_name" ] || [ "$job_name" = "null" ]; then
+      continue
+    fi
+    
+    # Check if this job already has a check run
+    if ! echo "$EXISTING_CHECK_NAMES" | grep -q "^${job_name}$"; then
+      # This job is expected - create an expected check entry
+      JOB_DATA=$(echo "$CIRCLE_JOBS_MAP" | jq --arg job "$job_name" '.[$job] // {}' 2>/dev/null)
+      
+      EXPECTED_CHECK=$(jq -n \
+        --arg name "ci/circleci: $job_name" \
+        --arg workflow "$(echo "$JOB_DATA" | jq -r '.workflow_name // ""' 2>/dev/null)" \
+        --arg pipeline "$(echo "$JOB_DATA" | jq -r '.pipeline_number // ""' 2>/dev/null)" \
+        --arg created "$(echo "$JOB_DATA" | jq -r '.pipeline_created_at // ""' 2>/dev/null)" \
+        --arg branch "$(echo "$JOB_DATA" | jq -r '.pipeline_branch // ""' 2>/dev/null)" \
+        '{
+          name: $name,
+          status: "pending",
+          conclusion: "pending",
+          description: "Expected — Waiting for status to be reported",
+          html_url: null,
+          started_at: null,
+          completed_at: null,
+          context: $name,
+          is_circleci: true,
+          type: "expected",
+          workflow_name: (if $workflow != "" then $workflow else null end),
+          pipeline_number: (if $pipeline != "" then $pipeline else null end),
+          pipeline_created_at: (if $created != "" then $created else null end),
+          pipeline_branch: (if $branch != "" then $branch else null end)
+        }' 2>/dev/null)
+      
+      if [ -n "$EXPECTED_CHECK" ]; then
+        ALL_CHECKS=$(echo "$ALL_CHECKS" | jq --argjson expected "$EXPECTED_CHECK" '. + [$expected]' 2>/dev/null || echo "$ALL_CHECKS")
+      fi
+    fi
+  done
+fi
+
 # Apply filters
 FILTERED_CHECKS="$ALL_CHECKS"
 
@@ -722,8 +867,8 @@ if [ -n "$DETAILS" ]; then
         if [ $? -eq 0 ] && [ -n "$TEST_DATA" ]; then
           # Check if test data is valid JSON and has tests
           if echo "$TEST_DATA" | jq empty 2>/dev/null; then
-            # Extract failed tests
-            FAILED_TESTS=$(echo "$TEST_DATA" | jq '[.tests[]? | select(.result == "failure" or .result == "error")]' 2>/dev/null)
+            # Extract failed tests (v2 API uses .items[])
+            FAILED_TESTS=$(echo "$TEST_DATA" | jq '[.items[]? | select(.result == "failure" or .result == "error")]' 2>/dev/null)
             if [ -n "$FAILED_TESTS" ] && [ "$FAILED_TESTS" != "null" ] && [ "$FAILED_TESTS" != "[]" ]; then
               CHECK=$(echo "$CHECK" | jq --argjson tests "$FAILED_TESTS" '. + {failed_tests: $tests}' 2>/dev/null || echo "$CHECK")
             fi
@@ -744,6 +889,24 @@ TOTAL=$(echo "$FILTERED_CHECKS" | jq 'length // 0' 2>/dev/null || echo "0")
 # Ensure TOTAL is numeric
 if ! [[ "$TOTAL" =~ ^[0-9]+$ ]]; then
   TOTAL=0
+fi
+
+# Calculate summary counts (for display at the end)
+if [ -z "$JSON_OUTPUT" ] && [ -z "$COUNT_ONLY" ]; then
+  FAILING_COUNT=$(echo "$FILTERED_CHECKS" | jq '[.[] | select(.status | ascii_downcase | test("failure|failed|error"; "i"))] | length' 2>/dev/null || echo "0")
+  EXPECTED_COUNT=$(echo "$FILTERED_CHECKS" | jq '[.[] | select((.type | ascii_downcase) == "expected")] | length' 2>/dev/null || echo "0")
+  SUCCESS_COUNT=$(echo "$FILTERED_CHECKS" | jq '[.[] | select(.status | ascii_downcase | test("success|successful"; "i"))] | length' 2>/dev/null || echo "0")
+  
+  # Ensure counts are numeric
+  if ! [[ "$FAILING_COUNT" =~ ^[0-9]+$ ]]; then
+    FAILING_COUNT=0
+  fi
+  if ! [[ "$EXPECTED_COUNT" =~ ^[0-9]+$ ]]; then
+    EXPECTED_COUNT=0
+  fi
+  if ! [[ "$SUCCESS_COUNT" =~ ^[0-9]+$ ]]; then
+    SUCCESS_COUNT=0
+  fi
 fi
 
 if [ -n "$COUNT_ONLY" ]; then
@@ -895,39 +1058,120 @@ else
           echo "$FAILED_TESTS" | jq -r '.[] | "  - \(.name // "Unknown test"): \(.message // "No message")"' 2>/dev/null
         fi
         
-        # Show job output for failed jobs (unless --hide-job-output is set)
+        # Show job output/logs for failed jobs (unless --hide-job-output is set)
+        # Following forum post: use v1.1 API to get job with steps/actions that have output_url
         if [ -z "$HIDE_JOB_OUTPUT" ] && [ "$CHECK_STATUS" != "success" ] && [ "$CHECK_STATUS" != "successful" ] && [ "$CHECK_STATUS" != "N/A" ] && [ "$JOB_NUMBER" != "N/A" ] && [ "$JOB_NUMBER" != "null" ]; then
-          JOB_OUTPUT=$(get_job_output "$JOB_NUMBER" 2>/dev/null)
-          if [ $? -eq 0 ] && [ -n "$JOB_OUTPUT" ]; then
-            # Check if output is valid JSON and has content
-            if echo "$JOB_OUTPUT" | jq empty 2>/dev/null; then
-              # CircleCI v1.1 API returns array of output items
-              # Each item has: time, type, message, step, etc.
-              # Filter for error/failure messages and step outputs
-              ERROR_OUTPUTS=$(echo "$JOB_OUTPUT" | jq '[.[]? | select(.type == "out" or .type == "stderr" or .type == "error" or (.message != null and (.message | test("error|fail|Error|Fail"; "i"))))] | .[0:50]' 2>/dev/null)
-              
-              if [ -n "$ERROR_OUTPUTS" ] && [ "$ERROR_OUTPUTS" != "null" ] && [ "$ERROR_OUTPUTS" != "[]" ]; then
-                OUTPUT_COUNT=$(echo "$ERROR_OUTPUTS" | jq 'length' 2>/dev/null || echo "0")
-                if [ "$OUTPUT_COUNT" -gt 0 ]; then
-                  echo ""
-                  echo "Job Output:"
-                  # Show step name and message for each output item
-                  echo "$ERROR_OUTPUTS" | jq -r '.[] | 
-                    if .step then "  [\(.step)]" else "" end,
-                    if .message then (.message | split("\n") | map("    " + .) | join("\n")) else "" end
-                  ' 2>/dev/null | head -100
-                  if [ "$OUTPUT_COUNT" -ge 50 ]; then
-                    echo "    ... (output truncated, showing first 50 items)"
+          # Get job details from v1.1 API to access steps/actions with output_url
+          # (v2 API doesn't provide steps/actions, so v1.1 is required for this step)
+          JOB_V1=$(get_job_with_steps_v1 "$JOB_NUMBER" 2>/dev/null)
+          if [ $? -eq 0 ] && [ -n "$JOB_V1" ] && echo "$JOB_V1" | jq empty 2>/dev/null; then
+            # Get all steps with their status (success/failure)
+            ALL_STEPS=$(echo "$JOB_V1" | jq '[.steps[]? | {
+              name: .name,
+              is_failed: (if any(.actions[]?; .failed == true or .status == "failed" or (.exit_code != null and .exit_code != 0)) then true else false end),
+              actions: [.actions[]? | {
+                name: .name,
+                failed: (.failed // false),
+                status: .status,
+                exit_code: .exit_code,
+                output_url: .output_url
+              }]
+            }]' 2>/dev/null)
+            
+            if [ -n "$ALL_STEPS" ] && [ "$ALL_STEPS" != "null" ] && [ "$ALL_STEPS" != "[]" ]; then
+              STEP_COUNT=$(echo "$ALL_STEPS" | jq 'length' 2>/dev/null || echo "0")
+              if [ "$STEP_COUNT" -gt 0 ]; then
+                echo ""
+                echo "Job Steps:"
+                
+                # Process each step
+                echo "$ALL_STEPS" | jq -c '.[]' 2>/dev/null | while IFS= read -r step_json; do
+                  step_name=$(echo "$step_json" | jq -r '.name // "Unknown step"' 2>/dev/null)
+                  is_failed=$(echo "$step_json" | jq -r '.is_failed // false' 2>/dev/null)
+                  
+                  # Display step status
+                  if [ "$is_failed" = "true" ]; then
+                    echo "  🔴 $step_name (Failed)"
+                  else
+                    echo "  🟢 $step_name (Success)"
                   fi
-                fi
+                  
+                  # Only show log output for failed steps
+                  if [ "$is_failed" = "true" ]; then
+                    # Find failed actions in this step
+                    failed_actions=$(echo "$step_json" | jq '[.actions[]? | select(.failed == true or .status == "failed" or (.exit_code != null and .exit_code != 0))]' 2>/dev/null)
+                    
+                    if [ -n "$failed_actions" ] && [ "$failed_actions" != "null" ] && [ "$failed_actions" != "[]" ]; then
+                      echo "$failed_actions" | jq -c '.[]' 2>/dev/null | while IFS= read -r action_json; do
+                        action_name=$(echo "$action_json" | jq -r '.name // "Unknown action"' 2>/dev/null)
+                        exit_code=$(echo "$action_json" | jq -r '.exit_code // "unknown"' 2>/dev/null)
+                        output_url=$(echo "$action_json" | jq -r '.output_url // ""' 2>/dev/null)
+                        
+                        echo "    Action: $action_name"
+                        echo "    Exit Code: $exit_code"
+                        
+                        # Download and display log if output_url is available
+                        if [ -n "$output_url" ] && [ "$output_url" != "" ] && [ "$output_url" != "null" ]; then
+                          echo ""
+                          echo "      Log Output:"
+                          log_content=$(download_log_from_url "$output_url" 2>/dev/null)
+                          if [ -n "$log_content" ]; then
+                            formatted_log=$(format_log_output "$log_content")
+                            if [ -n "$formatted_log" ]; then
+                              echo "$formatted_log" | sed 's/^/        /'
+                            else
+                              echo "        (Log content is empty)"
+                            fi
+                          else
+                            echo "        (Failed to download log or log is empty)"
+                          fi
+                          echo ""
+                        fi
+                      done
+                    fi
+                  fi
+                done
               fi
             fi
           fi
         fi
+        
       fi
       
       echo ""
     done
+    
+    # Display summary at the end
+    echo "---"
+    echo "Summary:"
+    SUMMARY_PARTS=()
+    if [ "$FAILING_COUNT" -gt 0 ]; then
+      SUMMARY_PARTS+=("🔴 $FAILING_COUNT failing")
+    fi
+    if [ "$EXPECTED_COUNT" -gt 0 ]; then
+      SUMMARY_PARTS+=("🟡 $EXPECTED_COUNT expected")
+    fi
+    if [ "$SUCCESS_COUNT" -gt 0 ]; then
+      SUMMARY_PARTS+=("🟢 $SUCCESS_COUNT successful")
+    fi
+    if [ ${#SUMMARY_PARTS[@]} -gt 0 ]; then
+      # Join array elements with ", "
+      FIRST=true
+      SUMMARY_TEXT=""
+      for part in "${SUMMARY_PARTS[@]}"; do
+        if [ "$FIRST" = true ]; then
+          SUMMARY_TEXT="$part"
+          FIRST=false
+        else
+          SUMMARY_TEXT="$SUMMARY_TEXT, $part"
+        fi
+      done
+      echo "$SUMMARY_TEXT checks"
+    else
+      echo "0 checks"
+    fi
+    echo ""
+    echo "PR: https://github.com/${REPO}/pull/${PULL_REQUEST}"
       else
         echo "No checks found matching the specified filters."
       fi
