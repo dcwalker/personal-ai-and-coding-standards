@@ -169,7 +169,6 @@ import subprocess
 import sys
 import argparse
 import yaml
-import time
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timezone
 
@@ -322,18 +321,6 @@ class LocalDeploymentNotifier:
                 })
         
         return result
-    
-    def get_uncommitted_files(self) -> List[str]:
-        """Get list of uncommitted files from git"""
-        success, output, _ = self.run_command(['git', 'status', '--porcelain'])
-        
-        if not success:
-            return []
-        
-        return [
-            line[3:] for line in output.split('\n') 
-            if line.strip()
-        ]
     
     def make_graphql_request(self, endpoint_url: str, query: str, variables: Optional[Dict] = None) -> Optional[Dict]:
         """Make GraphQL request to Compass API"""
@@ -903,7 +890,11 @@ class LocalDeploymentNotifier:
                             print(f"⚠️  Event source not found - attempting automatic creation...")
                             
                             # Extract site_url without https:// and trailing /
-                            clean_site = installation['site_url'].replace('https://', '').replace('/', '')
+                            clean_site = installation['site_url']
+                            if clean_site.startswith('https://'):
+                                clean_site = clean_site[8:]
+                            if clean_site.endswith('/'):
+                                clean_site = clean_site[:-1]
                             
                             # Try to create and attach the event source
                             if self.create_and_attach_event_source(
