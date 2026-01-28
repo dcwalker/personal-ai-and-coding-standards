@@ -12,20 +12,27 @@ except ImportError:
     sys.exit(1)
 
 FILES_TO_COPY = [
+    '.circleci/helpers/check-eslint-disable.sh',
+    '.circleci/helpers/check-markdown-placement.sh',
+    '.circleci/helpers/check-unpkg-usage.sh',
+    '.cursor',
+    '.prettierrc.cjs',
     'AGENTS.md',
     'CONTRIBUTING.md',
     'eslint.config.mjs',
-    '.prettierrc.cjs',
     'eslint-local-rules/index.mjs',
     'eslint-local-rules/no-consecutive-logging.mjs',
-    'scripts/list-sonar-issues.sh',
-    'scripts/list-pr-comments.sh',
     'scripts/list-pr-checks.sh',
+    'scripts/list-pr-comments.sh',
+    'scripts/list-sonar-issues.sh',
+    'scripts/local_deployment_notifier.py',
+    'scripts/run-ci-checks-local.sh',
+    'scripts/upgrade-all-packages.sh',
 ]
 
 
 def get_existing_files(source_dir: Path, files: list[str]) -> list[str]:
-    """Check which files exist in the source directory. Returns list of existing file paths."""
+    """Check which files or directories exist in the source directory. Returns list of existing paths."""
     existing = []
     for file in files:
         source_path = source_dir / file
@@ -165,6 +172,20 @@ def copy_file_to_directory(source_path: Path, target_path: Path, file: str) -> b
         return False
 
 
+def copy_directory_to_directory(source_path: Path, target_path: Path, directory: str) -> bool:
+    """Copy a directory recursively to target directory. Returns True on success, False on failure."""
+    try:
+        # Remove target directory if it exists to allow clean copy
+        if target_path.exists():
+            shutil.rmtree(target_path)
+        shutil.copytree(source_path, target_path, dirs_exist_ok=True)
+        print(f'  ✓ Copied {directory}')
+        return True
+    except Exception as error:
+        print(f'  ✗ Failed to copy {directory}: {error}', file=sys.stderr)
+        return False
+
+
 def copy_files_to_siblings():
     """Copy files from current repository to selected sibling directories."""
     current_dir = Path.cwd()
@@ -205,11 +226,15 @@ def copy_files_to_siblings():
         target_dir = parent_dir / dir_name
         print(f'Copying to {dir_name}...')
 
-        for file in existing_files:
-            source_path = current_dir / file
-            target_path = target_dir / file
-            if copy_file_to_directory(source_path, target_path, file):
-                copied_count += 1
+        for item in existing_files:
+            source_path = current_dir / item
+            target_path = target_dir / item
+            if source_path.is_dir():
+                if copy_directory_to_directory(source_path, target_path, item):
+                    copied_count += 1
+            else:
+                if copy_file_to_directory(source_path, target_path, item):
+                    copied_count += 1
 
     print(f'\nCompleted: Copied {copied_count} file{"s" if copied_count != 1 else ""} to {len(selected_directories)} director{"y" if len(selected_directories) == 1 else "ies"}.')
 
@@ -253,11 +278,15 @@ def copy_files_from_sibling():
     print(f'Copying from {selected_dir_name}...')
 
     copied_count = 0
-    for file in existing_files:
-        source_path = source_dir / file
-        target_path = current_dir / file
-        if copy_file_to_directory(source_path, target_path, file):
-            copied_count += 1
+    for item in existing_files:
+        source_path = source_dir / item
+        target_path = current_dir / item
+        if source_path.is_dir():
+            if copy_directory_to_directory(source_path, target_path, item):
+                copied_count += 1
+        else:
+            if copy_file_to_directory(source_path, target_path, item):
+                copied_count += 1
 
     print(f'\nCompleted: Copied {copied_count} file{"s" if copied_count != 1 else ""} from {selected_dir_name}.')
 
