@@ -55,6 +55,7 @@ JSON_OUTPUT=""
 COUNT_ONLY=""
 DETAILS=""
 HIDE_JOB_OUTPUT=""
+FOLLOW=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -99,6 +100,10 @@ while [[ $# -gt 0 ]]; do
       HIDE_JOB_OUTPUT="1"
       shift
       ;;
+    -f|--follow)
+      FOLLOW="1"
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
@@ -113,6 +118,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --count                        Output only the count of items"
       echo "  --details                      Include detailed information (test failures, step logs, CircleCI only)"
       echo "  --hide-job-output              Hide job output for failed checks (default: show output for failed CircleCI checks)"
+      echo "  -f, --follow                   Follow mode: show only summary and update every second until all checks complete"
       echo "  -h, --help                     Show this help message"
       echo ""
       echo "Note: By default, only checks from the most recent pipeline/run are shown (matching GitHub UI)."
@@ -123,7 +129,6 @@ while [[ $# -gt 0 ]]; do
       echo "Environment Variables:"
       echo "  CIRCLE_TOKEN                   CircleCI API token (required for CircleCI check details)"
       echo "                                Documentation: https://circleci.com/docs/managing-api-tokens/"
-      echo "  CIRCLE_PROJECT_SLUG            Optional project slug override (format: vcs-type/org/repo, e.g., gh/owner/repo)"
       exit 0
       ;;
     *)
@@ -283,7 +288,9 @@ get_github_status_checks() {
         started_at: .started_at,
         completed_at: .completed_at,
         context: .name,
+        check_run_id: .id,
         is_circleci: ((.app.slug // .app.name // "") | test("circleci"; "i")),
+        is_codeql: ((.name | test("^CodeQL$"; "i")) or ((.app.name // "") | test("^CodeQL$"; "i"))),
         type: "check_run"
       })
     ' 2>/dev/null)
@@ -308,7 +315,9 @@ get_github_status_checks() {
         started_at: null,
         completed_at: null,
         context: .context,
+        check_run_id: null,
         is_circleci: (.context | test("circleci"; "i")),
+        is_codeql: false,
         type: "status"
       }
     ' 2>/dev/null | jq -s '.' 2>/dev/null)
@@ -581,6 +590,33 @@ format_log_output() {
     done
 }
 
+# Function to get check run annotations from GitHub API
+get_check_run_annotations() {
+  local check_run_id="$1"
+  if [ -z "$check_run_id" ] || [ "$check_run_id" = "null" ] || [ "$check_run_id" = "" ]; then
+    echo "[]"
+    return 1
+  fi
+  
+  # Fetch annotations with pagination support (--paginate handles all pages automatically)
+  local annotations
+  annotations=$(gh api --paginate "repos/${REPO}/check-runs/${check_run_id}/annotations?per_page=100" 2>/dev/null)
+  local exit_code=$?
+  
+  if [ $exit_code -ne 0 ] || [ -z "$annotations" ]; then
+    echo "[]"
+    return 1
+  fi
+  
+  # Check if it's a JSON array
+  if ! echo "$annotations" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "[]"
+    return 1
+  fi
+  
+  echo "$annotations"
+}
+
 # Function to query recent pipelines as fallback (when branch-based query fails)
 get_recent_pipelines() {
   local url="${CIRCLE_API_BASE}/project/${PROJECT_SLUG}/pipeline?page-size=50"
@@ -641,8 +677,393 @@ get_recent_pipelines() {
   echo "$all_pipelines"
 }
 
+# Function to fetch checks and display summary (for follow mode)
+fetch_and_display_summary() {
+  local is_update="$1"  # "1" if updating in-place, "0" if first display
+  local is_first="$2"   # "true" if first iteration, "false" otherwise
+  local spinner_char="$3"  # Spinner character to display
+  
+  # Get all status checks from GitHub (fetch data BEFORE clearing screen)
+  local github_checks
+  github_checks=$(get_github_status_checks "$PULL_REQUEST")
+  
+  # Ensure we have valid JSON
+  if ! echo "$github_checks" | jq empty 2>/dev/null; then
+    github_checks="[]"
+  fi
+  
+  local check_count
+  check_count=$(echo "$github_checks" | jq 'length // 0' 2>/dev/null || echo "0")
+  
+  # Ensure CHECK_COUNT is numeric
+  if ! [[ "$check_count" =~ ^[0-9]+$ ]]; then
+    check_count=0
+  fi
+  
+  if [ "$check_count" -eq 0 ]; then
+    if [ -z "$JSON_OUTPUT" ]; then
+      if [ "$is_update" = "1" ]; then
+        printf "\033[8A\033[0J"  # Clear previous output
+      fi
+      echo "No status checks found for PR #${PULL_REQUEST}"
+    fi
+    return 1
+  fi
+  
+  # For CircleCI checks, enrich with CircleCI API data
+  local circle_jobs_map="{}"
+  local pipeline_errors_map="{}"
+  if echo "$github_checks" | jq '[.[] | select(.is_circleci == true)] | length' 2>/dev/null | grep -q '[1-9]'; then
+    # We have CircleCI checks, validate CIRCLE_TOKEN is set
+    if [ -z "$CIRCLE_TOKEN" ]; then
+      echo "Error: CIRCLE_TOKEN environment variable is not set (required for CircleCI check details)"
+      echo ""
+      echo "Documentation: https://circleci.com/docs/managing-api-tokens/"
+      return 1
+    fi
+    
+    # We have CircleCI checks, fetch pipeline data
+    local pipelines
+    pipelines=$(get_pipelines_for_pr "$PULL_REQUEST")
+    local pipeline_count
+    pipeline_count=$(echo "$pipelines" | jq 'length' 2>/dev/null || echo "0")
+    
+    if [ "$pipeline_count" -gt 0 ]; then
+      # Filter to latest pipeline
+      pipelines=$(echo "$pipelines" | jq 'sort_by(.created_at // "") | reverse | .[0:1]' 2>/dev/null || echo "$pipelines")
+      local pipeline_ids
+      pipeline_ids=$(echo "$pipelines" | jq -r '.[].id' 2>/dev/null)
+      
+      for pipeline_id in $pipeline_ids; do
+        if [ -z "$pipeline_id" ] || [ "$pipeline_id" = "null" ]; then
+          continue
+        fi
+        
+        local pipeline_number
+        pipeline_number=$(echo "$pipelines" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .number // "N/A"' 2>/dev/null)
+        local pipeline_created
+        pipeline_created=$(echo "$pipelines" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .created_at // "N/A"' 2>/dev/null)
+        local pipeline_vcs_branch
+        pipeline_vcs_branch=$(echo "$pipelines" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .vcs.branch // "N/A"' 2>/dev/null)
+        
+        # Extract pipeline errors if any
+        local pipeline_errors
+        pipeline_errors=$(echo "$pipelines" | jq -r --arg id "$pipeline_id" '.[] | select(.id == $id) | .errors // []' 2>/dev/null)
+        if [ -n "$pipeline_errors" ] && [ "$pipeline_errors" != "null" ] && [ "$pipeline_errors" != "[]" ]; then
+          if [ "$pipeline_number" != "N/A" ] && [ "$pipeline_number" != "null" ]; then
+            pipeline_errors_map=$(echo "$pipeline_errors_map" | jq --arg pipeline_number "$pipeline_number" --argjson errors "$pipeline_errors" '.[$pipeline_number] = $errors' 2>/dev/null || echo "$pipeline_errors_map")
+          fi
+        fi
+        
+        local workflows
+        workflows=$(get_workflows_for_pipeline "$pipeline_id")
+        local workflow_ids
+        workflow_ids=$(echo "$workflows" | jq -r '.[].id' 2>/dev/null)
+        
+        for workflow_id in $workflow_ids; do
+          if [ -z "$workflow_id" ] || [ "$workflow_id" = "null" ]; then
+            continue
+          fi
+        
+          local workflow_name
+          workflow_name=$(echo "$workflows" | jq -r --arg id "$workflow_id" '.[] | select(.id == $id) | .name' 2>/dev/null)
+          local jobs
+          jobs=$(get_jobs_for_workflow "$workflow_id")
+          
+          # Create a map of job name -> job data for quick lookup
+          local jobs_map
+          jobs_map=$(echo "$jobs" | jq --arg workflow_name "$workflow_name" --arg pipeline_number "$pipeline_number" --arg pipeline_created "$pipeline_created" --arg pipeline_branch "$pipeline_vcs_branch" '
+            reduce .[] as $job ({}; .[$job.name] = ($job + {
+              workflow_name: $workflow_name,
+              pipeline_number: ($pipeline_number | if . == "N/A" then null else . end),
+              pipeline_created_at: ($pipeline_created | if . == "N/A" then null else . end),
+              pipeline_branch: ($pipeline_branch | if . == "N/A" then null else . end)
+            }))
+          ' 2>/dev/null || echo "{}")
+          
+          # Merge into CIRCLE_JOBS_MAP
+          circle_jobs_map=$(echo "$circle_jobs_map" | jq --argjson jobs "$jobs_map" '. + $jobs' 2>/dev/null || echo "$circle_jobs_map")
+        done
+      done
+    fi
+  fi
+  
+  # Enrich GitHub checks with CircleCI data where applicable
+  local all_checks
+  all_checks=$(echo "$github_checks" | jq --argjson circle_jobs "$circle_jobs_map" --argjson pipeline_errors "$pipeline_errors_map" '
+    map(
+      . as $check |
+      if $check.is_circleci == true then
+        # Extract job name from context (e.g., "ci/circleci: job_name" -> "job_name")
+        ($check.context | split(": ") | if length > 1 then .[1] else $check.context end) as $job_name |
+        ($circle_jobs[$job_name] // {}) as $circle_job |
+        ($circle_job.pipeline_number // null) as $pipeline_num |
+        # If no pipeline number from job, try to get first pipeline number from errors map
+        (if $pipeline_num == null then ($pipeline_errors | keys | if length > 0 then .[0] else null end) else ($pipeline_num | tostring) end) as $pipeline_key |
+        ($pipeline_errors[$pipeline_key] // null) as $errors |
+        $check + {
+          job_number: $circle_job.job_number,
+          workflow_name: $circle_job.workflow_name,
+          pipeline_number: ($circle_job.pipeline_number // (if $pipeline_key != null then ($pipeline_key | tonumber) else null end)),
+          pipeline_created_at: $circle_job.pipeline_created_at,
+          pipeline_branch: $circle_job.pipeline_branch,
+          pipeline_errors: $errors,
+          started_at: ($circle_job.started_at // $check.started_at),
+          stopped_at: ($circle_job.stopped_at // $check.completed_at)
+        }
+      else
+        $check
+      end
+    )
+  ' 2>/dev/null || echo "$github_checks")
+  
+  # Find expected CircleCI jobs (jobs in workflow but no check run yet)
+  if [ -n "$circle_jobs_map" ] && [ "$circle_jobs_map" != "{}" ] && [ "$circle_jobs_map" != "null" ]; then
+    # Get list of job names from CircleCI workflow
+    local workflow_job_names
+    workflow_job_names=$(echo "$circle_jobs_map" | jq -r 'keys[]' 2>/dev/null)
+    
+    # Get list of existing CircleCI check names from GitHub
+    local existing_check_names
+    existing_check_names=$(echo "$all_checks" | jq -r '.[] | select(.is_circleci == true) | (.context | split(": ") | if length > 1 then .[1] else .context end)' 2>/dev/null)
+    
+    # Find missing jobs (in workflow but not in GitHub checks)
+    for job_name in $workflow_job_names; do
+      if [ -z "$job_name" ] || [ "$job_name" = "null" ]; then
+        continue
+      fi
+      
+      # Check if this job already has a check run
+      if ! echo "$existing_check_names" | grep -q "^${job_name}$"; then
+        # This job is expected - create an expected check entry
+        local job_data
+        job_data=$(echo "$circle_jobs_map" | jq --arg job "$job_name" '.[$job] // {}' 2>/dev/null)
+        
+        local expected_check
+        expected_check=$(jq -n \
+          --arg name "ci/circleci: $job_name" \
+          --arg workflow "$(echo "$job_data" | jq -r '.workflow_name // ""' 2>/dev/null)" \
+          --arg pipeline "$(echo "$job_data" | jq -r '.pipeline_number // ""' 2>/dev/null)" \
+          --arg created "$(echo "$job_data" | jq -r '.pipeline_created_at // ""' 2>/dev/null)" \
+          --arg branch "$(echo "$job_data" | jq -r '.pipeline_branch // ""' 2>/dev/null)" \
+          '{
+            name: $name,
+            status: "pending",
+            conclusion: "pending",
+            description: "Expected — Waiting for status to be reported",
+            html_url: null,
+            started_at: null,
+            completed_at: null,
+            context: $name,
+            is_circleci: true,
+            type: "expected",
+            workflow_name: (if $workflow != "" then $workflow else null end),
+            pipeline_number: (if $pipeline != "" then $pipeline else null end),
+            pipeline_created_at: (if $created != "" then $created else null end),
+            pipeline_branch: (if $branch != "" then $branch else null end)
+          }' 2>/dev/null)
+        
+        if [ -n "$expected_check" ]; then
+          all_checks=$(echo "$all_checks" | jq --argjson expected "$expected_check" '. + [$expected]' 2>/dev/null || echo "$all_checks")
+        fi
+      fi
+    done
+  fi
+  
+  # Apply filters
+  local filtered_checks="$all_checks"
+  
+  # Apply job/check name filter
+  if [ -n "$JOB_FILTER" ]; then
+    filtered_checks=$(echo "$filtered_checks" | jq --arg filter "$JOB_FILTER" '[.[] | select(.name == $filter or .context == $filter or (.context | contains($filter)))]' 2>/dev/null || echo "$filtered_checks")
+  fi
+  
+  # Apply workflow filter (only applies to CircleCI checks)
+  if [ -n "$WORKFLOW_FILTER" ]; then
+    filtered_checks=$(echo "$filtered_checks" | jq --arg filter "$WORKFLOW_FILTER" '[.[] | select(.is_circleci != true or .workflow_name == $filter)]' 2>/dev/null || echo "$filtered_checks")
+  fi
+  
+  # Apply status filters (OR logic - if multiple are specified, show checks matching any)
+  # Map GitHub status values to our filter values
+  if [ -n "$SHOW_FAILING" ] || [ -n "$SHOW_PASSING" ] || [ -n "$SHOW_IN_PROGRESS" ]; then
+    local status_filter_parts=()
+    
+    if [ -n "$SHOW_FAILING" ]; then
+      status_filter_parts+=("failed|error|failure")
+    fi
+    
+    if [ -n "$SHOW_PASSING" ]; then
+      status_filter_parts+=("success|successful")
+    fi
+    
+    if [ -n "$SHOW_IN_PROGRESS" ]; then
+      status_filter_parts+=("running|pending|in_progress|queued|in_progress|waiting")
+    fi
+    
+    # Join all filter parts with |
+    local status_filter
+    status_filter=$(IFS='|'; echo "${status_filter_parts[*]}")
+    
+    # Filter checks by status (case-insensitive)
+    filtered_checks=$(echo "$filtered_checks" | jq --arg filter "$status_filter" '
+      [.[] | select(.status | ascii_downcase | test($filter; "i"))]
+    ' 2>/dev/null || echo "$filtered_checks")
+  fi
+  
+  # Calculate summary counts
+  local failing_count
+  failing_count=$(echo "$filtered_checks" | jq '[.[] | select(.status | ascii_downcase | test("failure|failed|error"; "i"))] | length' 2>/dev/null || echo "0")
+  local expected_count
+  expected_count=$(echo "$filtered_checks" | jq '[.[] | select((.type | ascii_downcase) == "expected")] | length' 2>/dev/null || echo "0")
+  local pending_count
+  pending_count=$(echo "$filtered_checks" | jq '[.[] | select((.status | ascii_downcase) == "pending" and ((.type | ascii_downcase) != "expected"))] | length' 2>/dev/null || echo "0")
+  local success_count
+  success_count=$(echo "$filtered_checks" | jq '[.[] | select(.status | ascii_downcase | test("success|successful"; "i"))] | length' 2>/dev/null || echo "0")
+  local in_progress_count
+  in_progress_count=$(echo "$filtered_checks" | jq '[.[] | select(.status | ascii_downcase | test("in_progress|running|inprogress|queued"; "i"))] | length' 2>/dev/null || echo "0")
+  
+  # Ensure counts are numeric
+  if ! [[ "$failing_count" =~ ^[0-9]+$ ]]; then
+    failing_count=0
+  fi
+  if ! [[ "$expected_count" =~ ^[0-9]+$ ]]; then
+    expected_count=0
+  fi
+  if ! [[ "$pending_count" =~ ^[0-9]+$ ]]; then
+    pending_count=0
+  fi
+  if ! [[ "$success_count" =~ ^[0-9]+$ ]]; then
+    success_count=0
+  fi
+  if ! [[ "$in_progress_count" =~ ^[0-9]+$ ]]; then
+    in_progress_count=0
+  fi
+  
+  # Get last commit SHA and summary from origin (via GitHub API) BEFORE clearing screen
+  # Always fetch commit data for consistent line count
+  local pr_data
+  pr_data=$(gh api "repos/${REPO}/pulls/${PULL_REQUEST}" 2>/dev/null)
+  local head_sha=""
+  local short_sha=""
+  local commit_summary=""
+  
+  if [ $? -eq 0 ] && [ -n "$pr_data" ]; then
+    head_sha=$(echo "$pr_data" | jq -r '.head.sha // empty' 2>/dev/null)
+    if [ -n "$head_sha" ] && [ "$head_sha" != "null" ] && [ "$head_sha" != "" ]; then
+      # Get short SHA (first 7 characters)
+      short_sha=$(echo "$head_sha" | cut -c1-7)
+      
+      # Get commit message summary (first line) from GitHub API
+      local commit_data
+      commit_data=$(gh api "repos/${REPO}/commits/${head_sha}" 2>/dev/null)
+      if [ $? -eq 0 ] && [ -n "$commit_data" ]; then
+        commit_summary=$(echo "$commit_data" | jq -r '.commit.message // ""' 2>/dev/null | head -n1 | sed 's/\r$//')
+      fi
+    fi
+  fi
+  
+  # Build summary text BEFORE clearing screen
+  local summary_parts=()
+  if [ "$failing_count" -gt 0 ]; then
+    summary_parts+=("🔴 $failing_count failing")
+  fi
+  if [ "$expected_count" -gt 0 ]; then
+    summary_parts+=("🟠 $expected_count expected")
+  fi
+  if [ "$pending_count" -gt 0 ]; then
+    summary_parts+=("🟡 $pending_count pending")
+  fi
+  if [ "$in_progress_count" -gt 0 ]; then
+    summary_parts+=("🟠 $in_progress_count in progress")
+  fi
+  if [ "$success_count" -gt 0 ]; then
+    summary_parts+=("🟢 $success_count successful")
+  fi
+  
+  local summary_text=""
+  if [ ${#summary_parts[@]} -gt 0 ]; then
+    # Join array elements with ", "
+    local first=true
+    for part in "${summary_parts[@]}"; do
+      if [ "$first" = true ]; then
+        summary_text="$part"
+        first=false
+      else
+        summary_text="$summary_text, $part"
+      fi
+    done
+    summary_text="${summary_text} checks"
+  else
+    summary_text="0 checks"
+  fi
+  
+  # Now that we have ALL data ready (checks, counts, commit info), clear and display
+  if [ "$is_update" = "1" ]; then
+    # Restore cursor to saved position (start of our output area) and clear from there to end of screen
+    printf "\033[u\033[0J"  # Restore cursor position and clear from cursor to end of screen
+  elif [ "$is_first" = true ]; then
+    # Save cursor position at start of output (after any initial messages)
+    printf "\033[s"  # Save cursor position
+  fi
+  
+  # Display summary (all data is now ready, print everything at once)
+  # \033[2K clears the entire line (both before and after cursor)
+  if [ "$is_update" = "1" ]; then
+    # Print all lines at once, clearing each line first
+    printf "\033[2K\rSummary:\n"
+    printf "\033[2K\r%s\n" "$summary_text"
+    printf "\033[2K\r\n"
+    printf "\033[2K\rLast commit:\n"
+    if [ -n "$short_sha" ] && [ "$short_sha" != "" ]; then
+      if [ -n "$commit_summary" ] && [ "$commit_summary" != "" ] && [ "$commit_summary" != "null" ]; then
+        printf "\033[2K\r  %s - %s\n" "$short_sha" "$commit_summary"
+      else
+        printf "\033[2K\r  %s\n" "$short_sha"
+      fi
+    else
+      printf "\033[2K\r  (no commit info)\n"
+    fi
+    printf "\033[2K\r\n"
+    # Show PR link
+    printf "\033[2K\rPR: https://github.com/${REPO}/pull/${PULL_REQUEST}\n"
+    # Show spinner on its own line at the end of output
+    if [ -n "$spinner_char" ]; then
+      printf "\033[2K\r%s\n" "$spinner_char"
+    fi
+  else
+    echo "Summary:"
+    echo "$summary_text"
+    echo ""
+    echo "Last commit:"
+    if [ -n "$short_sha" ] && [ "$short_sha" != "" ]; then
+      if [ -n "$commit_summary" ] && [ "$commit_summary" != "" ] && [ "$commit_summary" != "null" ]; then
+        echo "  ${short_sha} - ${commit_summary}"
+      else
+        echo "  ${short_sha}"
+      fi
+    else
+      echo "  (no commit info)"
+    fi
+    echo ""
+    # Show PR link
+    echo "PR: https://github.com/${REPO}/pull/${PULL_REQUEST}"
+    # Show spinner on its own line at the end of output
+    if [ -n "$spinner_char" ]; then
+      echo "$spinner_char"
+    fi
+  fi
+  
+  # Return 0 if all checks are complete
+  # Exit when there are no pending or in_progress checks (expected checks won't finish, so don't wait for them)
+  if [ "$pending_count" -eq 0 ] && [ "$in_progress_count" -eq 0 ]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
 # Main execution
-if [ -z "$JSON_OUTPUT" ]; then
+if [ -z "$JSON_OUTPUT" ] && [ -z "$FOLLOW" ]; then
   echo "Fetching status checks for PR #${PULL_REQUEST}..."
 fi
 
@@ -670,7 +1091,44 @@ if [ "$CHECK_COUNT" -eq 0 ]; then
   exit 0
 fi
 
-if [ -z "$JSON_OUTPUT" ]; then
+# Handle follow mode
+if [ -n "$FOLLOW" ]; then
+  # Follow mode is incompatible with JSON output and count-only mode
+  if [ -n "$JSON_OUTPUT" ] || [ -n "$COUNT_ONLY" ]; then
+    echo "Error: --follow cannot be used with --json or --count options"
+    exit 1
+  fi
+  
+  # Loop until all checks are complete
+  FIRST_ITERATION=true
+  SPINNER_STATE=0
+  SPINNER_CHARS=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  while true; do
+    is_update="0"
+    if [ "$FIRST_ITERATION" != true ]; then
+      is_update="1"
+    fi
+    
+    # Pass spinner character to display function
+    SPINNER_CHAR="${SPINNER_CHARS[$SPINNER_STATE]}"
+    if fetch_and_display_summary "$is_update" "$([ "$FIRST_ITERATION" = true ] && echo "true" || echo "false")" "$SPINNER_CHAR"; then
+      # All checks are complete, clear spinner and exit
+      # Move cursor to spinner line and clear it
+      printf "\033[1A\r\033[K"
+      break
+    fi
+    
+    FIRST_ITERATION=false
+    # Rotate spinner for next iteration
+    SPINNER_STATE=$(( (SPINNER_STATE + 1) % ${#SPINNER_CHARS[@]} ))
+    sleep 1
+  done
+  
+  exit 0
+fi
+
+# Only print "Found" message if not in follow mode
+if [ -z "$JSON_OUTPUT" ] && [ -z "$FOLLOW" ]; then
   echo "Found $CHECK_COUNT status check(s)"
 fi
 
@@ -768,6 +1226,19 @@ ALL_CHECKS=$(echo "$GITHUB_CHECKS" | jq --argjson circle_jobs "$CIRCLE_JOBS_MAP"
     end
   )
 ' 2>/dev/null || echo "$GITHUB_CHECKS")
+
+# Enrich CodeQL checks with annotations for failed checks
+ALL_CHECKS=$(echo "$ALL_CHECKS" | jq '
+  map(
+    . as $check |
+    if $check.is_codeql == true and ($check.status | ascii_downcase | test("failure|failed|error"; "i")) and ($check.check_run_id != null) then
+      # Annotations will be fetched and added in the display section
+      $check
+    else
+      $check
+    end
+  )
+' 2>/dev/null || echo "$ALL_CHECKS")
 
 # Find expected CircleCI jobs (jobs in workflow but no check run yet)
 if [ -n "$CIRCLE_JOBS_MAP" ] && [ "$CIRCLE_JOBS_MAP" != "{}" ] && [ "$CIRCLE_JOBS_MAP" != "null" ]; then
@@ -909,6 +1380,7 @@ fi
 if [ -z "$JSON_OUTPUT" ] && [ -z "$COUNT_ONLY" ]; then
   FAILING_COUNT=$(echo "$FILTERED_CHECKS" | jq '[.[] | select(.status | ascii_downcase | test("failure|failed|error"; "i"))] | length' 2>/dev/null || echo "0")
   EXPECTED_COUNT=$(echo "$FILTERED_CHECKS" | jq '[.[] | select((.type | ascii_downcase) == "expected")] | length' 2>/dev/null || echo "0")
+  PENDING_COUNT=$(echo "$FILTERED_CHECKS" | jq '[.[] | select((.status | ascii_downcase) == "pending" and ((.type | ascii_downcase) != "expected"))] | length' 2>/dev/null || echo "0")
   SUCCESS_COUNT=$(echo "$FILTERED_CHECKS" | jq '[.[] | select(.status | ascii_downcase | test("success|successful"; "i"))] | length' 2>/dev/null || echo "0")
   
   # Ensure counts are numeric
@@ -917,6 +1389,9 @@ if [ -z "$JSON_OUTPUT" ] && [ -z "$COUNT_ONLY" ]; then
   fi
   if ! [[ "$EXPECTED_COUNT" =~ ^[0-9]+$ ]]; then
     EXPECTED_COUNT=0
+  fi
+  if ! [[ "$PENDING_COUNT" =~ ^[0-9]+$ ]]; then
+    PENDING_COUNT=0
   fi
   if ! [[ "$SUCCESS_COUNT" =~ ^[0-9]+$ ]]; then
     SUCCESS_COUNT=0
@@ -938,11 +1413,14 @@ else
       
       CHECK_NAME=$(echo "$CHECK" | jq -r '.name // .context // "N/A"')
       CHECK_STATUS=$(echo "$CHECK" | jq -r '.status // "N/A"')
+      CHECK_TYPE=$(echo "$CHECK" | jq -r '.type // ""' 2>/dev/null)
       CHECK_DESCRIPTION=$(echo "$CHECK" | jq -r '.description // "N/A"')
       CHECK_URL=$(echo "$CHECK" | jq -r '.html_url // .url // .detailsUrl // "N/A"')
       STARTED_AT=$(echo "$CHECK" | jq -r '.started_at // "N/A"')
       STOPPED_AT=$(echo "$CHECK" | jq -r '.stopped_at // .completed_at // "N/A"')
       IS_CIRCLECI=$(echo "$CHECK" | jq -r '.is_circleci // false' 2>/dev/null)
+      IS_CODEQL=$(echo "$CHECK" | jq -r '.is_codeql // false' 2>/dev/null)
+      CHECK_RUN_ID=$(echo "$CHECK" | jq -r '.check_run_id // null' 2>/dev/null)
       
       # CircleCI-specific fields
       WORKFLOW_NAME=$(echo "$CHECK" | jq -r '.workflow_name // "N/A"')
@@ -952,28 +1430,34 @@ else
       PIPELINE_BRANCH=$(echo "$CHECK" | jq -r '.pipeline_branch // "N/A"')
       PIPELINE_ERRORS=$(echo "$CHECK" | jq '.pipeline_errors // null' 2>/dev/null)
       
-      # Determine emoji based on status
+      # Determine emoji based on status and type
       STATUS_LOWER=$(echo "$CHECK_STATUS" | tr '[:upper:]' '[:lower:]')
-      case "$STATUS_LOWER" in
-        success|successful)
-          STATUS_EMOJI="🟢"
-          ;;
-        failure|failed|error)
-          STATUS_EMOJI="🔴"
-          ;;
-        pending|queued|waiting)
-          STATUS_EMOJI="🟡"
-          ;;
-        in_progress|running|inprogress)
-          STATUS_EMOJI="🟠"
-          ;;
-        neutral|cancelled|canceled|skipped)
-          STATUS_EMOJI="⚪"
-          ;;
-        *)
-          STATUS_EMOJI="⚫"
-          ;;
-      esac
+      TYPE_LOWER=$(echo "$CHECK_TYPE" | tr '[:upper:]' '[:lower:]')
+      # Expected checks should show as orange (🟠) even if status is pending
+      if [ "$TYPE_LOWER" = "expected" ]; then
+        STATUS_EMOJI="🟠"
+      else
+        case "$STATUS_LOWER" in
+          success|successful)
+            STATUS_EMOJI="🟢"
+            ;;
+          failure|failed|error)
+            STATUS_EMOJI="🔴"
+            ;;
+          pending|queued|waiting)
+            STATUS_EMOJI="🟡"
+            ;;
+          in_progress|running|inprogress)
+            STATUS_EMOJI="🟠"
+            ;;
+          neutral|cancelled|canceled|skipped)
+            STATUS_EMOJI="⚪"
+            ;;
+          *)
+            STATUS_EMOJI="⚫"
+            ;;
+        esac
+      fi
       
       echo ""
       echo "Check: $CHECK_NAME"
@@ -1162,6 +1646,125 @@ else
         
       fi
       
+      # Show CodeQL annotations for failed checks (unless --hide-job-output is set)
+      if [ "$IS_CODEQL" = "true" ] && [ -z "$HIDE_JOB_OUTPUT" ] && [ "$CHECK_STATUS" != "success" ] && [ "$CHECK_STATUS" != "successful" ] && [ "$CHECK_STATUS" != "N/A" ] && [ "$CHECK_RUN_ID" != "null" ] && [ -n "$CHECK_RUN_ID" ]; then
+        # Fetch annotations for this CodeQL check run
+        ANNOTATIONS=$(get_check_run_annotations "$CHECK_RUN_ID" 2>/dev/null)
+        if [ $? -eq 0 ] && [ -n "$ANNOTATIONS" ] && echo "$ANNOTATIONS" | jq empty 2>/dev/null; then
+          ANNOTATION_COUNT=$(echo "$ANNOTATIONS" | jq 'length' 2>/dev/null || echo "0")
+          if [ "$ANNOTATION_COUNT" -gt 0 ]; then
+            echo ""
+            echo "Security Alerts:"
+            
+            # Group annotations by severity level (annotation_level: failure, warning, notice)
+            # Map to more readable severity names
+            HIGH_ALERTS=$(echo "$ANNOTATIONS" | jq '[.[] | select(.annotation_level == "failure")]' 2>/dev/null)
+            MEDIUM_ALERTS=$(echo "$ANNOTATIONS" | jq '[.[] | select(.annotation_level == "warning")]' 2>/dev/null)
+            LOW_ALERTS=$(echo "$ANNOTATIONS" | jq '[.[] | select(.annotation_level == "notice")]' 2>/dev/null)
+            
+            HIGH_COUNT=$(echo "$HIGH_ALERTS" | jq 'length' 2>/dev/null || echo "0")
+            MEDIUM_COUNT=$(echo "$MEDIUM_ALERTS" | jq 'length' 2>/dev/null || echo "0")
+            LOW_COUNT=$(echo "$LOW_ALERTS" | jq 'length' 2>/dev/null || echo "0")
+            
+            if [ "$HIGH_COUNT" -gt 0 ] || [ "$MEDIUM_COUNT" -gt 0 ] || [ "$LOW_COUNT" -gt 0 ]; then
+              if [ "$HIGH_COUNT" -gt 0 ]; then
+                echo "  High: $HIGH_COUNT"
+              fi
+              if [ "$MEDIUM_COUNT" -gt 0 ]; then
+                echo "  Medium: $MEDIUM_COUNT"
+              fi
+              if [ "$LOW_COUNT" -gt 0 ]; then
+                echo "  Low: $LOW_COUNT"
+              fi
+              echo ""
+            fi
+            
+            # Display annotations, prioritizing high severity first
+            if [ "$HIGH_COUNT" -gt 0 ]; then
+              echo "$HIGH_ALERTS" | jq -c '.[]' 2>/dev/null | while IFS= read -r annotation; do
+                path=$(echo "$annotation" | jq -r '.path // "N/A"' 2>/dev/null)
+                start_line=$(echo "$annotation" | jq -r '.start_line // "N/A"' 2>/dev/null)
+                end_line=$(echo "$annotation" | jq -r '.end_line // "N/A"' 2>/dev/null)
+                title=$(echo "$annotation" | jq -r '.title // "Security Alert"' 2>/dev/null)
+                message=$(echo "$annotation" | jq -r '.message // "No message"' 2>/dev/null)
+                
+                if [ "$start_line" = "$end_line" ]; then
+                  line_info="line $start_line"
+                else
+                  line_info="lines $start_line-$end_line"
+                fi
+                
+                echo "  🔴 $path:$line_info"
+                echo "     $title"
+                if [ "$message" != "No message" ] && [ -n "$message" ]; then
+                  # Truncate long messages to first 200 characters
+                  message_len=$(echo "$message" | wc -c | tr -d ' ')
+                  if [ "$message_len" -gt 200 ]; then
+                    message=$(echo "$message" | cut -c1-200)"..."
+                  fi
+                  echo "     $message"
+                fi
+                echo ""
+              done
+            fi
+            
+            if [ "$MEDIUM_COUNT" -gt 0 ]; then
+              echo "$MEDIUM_ALERTS" | jq -c '.[]' 2>/dev/null | while IFS= read -r annotation; do
+                path=$(echo "$annotation" | jq -r '.path // "N/A"' 2>/dev/null)
+                start_line=$(echo "$annotation" | jq -r '.start_line // "N/A"' 2>/dev/null)
+                end_line=$(echo "$annotation" | jq -r '.end_line // "N/A"' 2>/dev/null)
+                title=$(echo "$annotation" | jq -r '.title // "Security Alert"' 2>/dev/null)
+                message=$(echo "$annotation" | jq -r '.message // "No message"' 2>/dev/null)
+                
+                if [ "$start_line" = "$end_line" ]; then
+                  line_info="line $start_line"
+                else
+                  line_info="lines $start_line-$end_line"
+                fi
+                
+                echo "  🟡 $path:$line_info"
+                echo "     $title"
+                if [ "$message" != "No message" ] && [ -n "$message" ]; then
+                  message_len=$(echo "$message" | wc -c | tr -d ' ')
+                  if [ "$message_len" -gt 200 ]; then
+                    message=$(echo "$message" | cut -c1-200)"..."
+                  fi
+                  echo "     $message"
+                fi
+                echo ""
+              done
+            fi
+            
+            if [ "$LOW_COUNT" -gt 0 ]; then
+              echo "$LOW_ALERTS" | jq -c '.[]' 2>/dev/null | while IFS= read -r annotation; do
+                path=$(echo "$annotation" | jq -r '.path // "N/A"' 2>/dev/null)
+                start_line=$(echo "$annotation" | jq -r '.start_line // "N/A"' 2>/dev/null)
+                end_line=$(echo "$annotation" | jq -r '.end_line // "N/A"' 2>/dev/null)
+                title=$(echo "$annotation" | jq -r '.title // "Security Alert"' 2>/dev/null)
+                message=$(echo "$annotation" | jq -r '.message // "No message"' 2>/dev/null)
+                
+                if [ "$start_line" = "$end_line" ]; then
+                  line_info="line $start_line"
+                else
+                  line_info="lines $start_line-$end_line"
+                fi
+                
+                echo "  ⚪ $path:$line_info"
+                echo "     $title"
+                if [ "$message" != "No message" ] && [ -n "$message" ]; then
+                  message_len=$(echo "$message" | wc -c | tr -d ' ')
+                  if [ "$message_len" -gt 200 ]; then
+                    message=$(echo "$message" | cut -c1-200)"..."
+                  fi
+                  echo "     $message"
+                fi
+                echo ""
+              done
+            fi
+          fi
+        fi
+      fi
+      
       echo ""
     done
     
@@ -1173,7 +1776,10 @@ else
       SUMMARY_PARTS+=("🔴 $FAILING_COUNT failing")
     fi
     if [ "$EXPECTED_COUNT" -gt 0 ]; then
-      SUMMARY_PARTS+=("🟡 $EXPECTED_COUNT expected")
+      SUMMARY_PARTS+=("🟠 $EXPECTED_COUNT expected")
+    fi
+    if [ "$PENDING_COUNT" -gt 0 ]; then
+      SUMMARY_PARTS+=("🟡 $PENDING_COUNT pending")
     fi
     if [ "$SUCCESS_COUNT" -gt 0 ]; then
       SUMMARY_PARTS+=("🟢 $SUCCESS_COUNT successful")
